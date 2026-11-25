@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
@@ -113,7 +114,7 @@ public sealed class MainWindow : Window
     {
         ImGui.TextColored(Theme.YellowMain, "FRIENDLIST FRENZY");
         ImGui.SameLine();
-        ImGui.TextColored(Theme.TextMuted, "v1.0.0.2  •");
+        ImGui.TextColored(Theme.TextMuted, "v1.0.0.3  •");
         ImGui.SameLine();
 
         var total = Plugin.Friends.TotalCount;
@@ -122,13 +123,30 @@ public sealed class MainWindow : Window
         ImGui.SameLine();
         ImGui.TextColored(Theme.GreenOnline, $"({online} {L.T("online", "online")})");
 
-        // Right-aligned Refresh + Language toggle
+        // Right-aligned Support Me + Refresh + Language toggle
+        var supportW = 98f;
         var refreshW = 92f;
         var langW = 68f;
-        var rightOffset = ImGui.GetContentRegionAvail().X - (refreshW + langW + 10f);
+        var rightOffset = ImGui.GetContentRegionAvail().X - (supportW + refreshW + langW + 18f);
         if (rightOffset > 0) ImGui.SameLine(ImGui.GetCursorPosX() + rightOffset);
         else ImGui.SameLine();
 
+        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.95f, 0.32f, 0.38f, 0.90f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(1.00f, 0.44f, 0.49f, 1.00f));
+        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.80f, 0.22f, 0.28f, 1.00f));
+        if (ImGui.Button(L.T("♥ Support Me", "♥ Apoiar"), new Vector2(supportW, 0)))
+        {
+            try { Process.Start(new ProcessStartInfo("https://ko-fi.com/n0way02") { UseShellExecute = true }); } catch { }
+        }
+        ImGui.PopStyleColor(3);
+        if (ImGui.IsItemHovered())
+        {
+            ImGui.SetTooltip("Support me on Ko-fi\nhttps://ko-fi.com/n0way02");
+            if (ImGui.IsMouseClicked(ImGuiMouseButton.Right))
+                ImGui.SetClipboardText("https://ko-fi.com/n0way02");
+        }
+
+        ImGui.SameLine();
         if (ImGui.Button(L.T("Refresh", "Atualizar"), new Vector2(refreshW, 0)))
         {
             Plugin.Friends.RequestRefresh();
