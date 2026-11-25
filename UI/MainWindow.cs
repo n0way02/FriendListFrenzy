@@ -113,7 +113,7 @@ public sealed class MainWindow : Window
     {
         ImGui.TextColored(Theme.YellowMain, "FRIENDLIST FRENZY");
         ImGui.SameLine();
-        ImGui.TextColored(Theme.TextMuted, "v1.0.0.0  •");
+        ImGui.TextColored(Theme.TextMuted, "v1.0.0.1  •");
         ImGui.SameLine();
 
         var total = Plugin.Friends.TotalCount;
@@ -654,13 +654,13 @@ public sealed class MainWindow : Window
     {
         if (openEditModal)
         {
-            ImGui.OpenPopup("##EditFriendPopup");
+            ImGui.OpenPopup("###EditFriendPopup");
             openEditModal = false;
         }
 
         var open = true;
         ImGui.SetNextWindowSize(new Vector2(440, 320), ImGuiCond.Appearing);
-        if (ImGui.BeginPopupModal(L.T("Edit Friend##EditFriendPopup", "Editar Amigo##EditFriendPopup"), ref open, ImGuiWindowFlags.NoResize))
+        if (ImGui.BeginPopupModal(L.T("Edit Friend###EditFriendPopup", "Editar Amigo###EditFriendPopup"), ref open, ImGuiWindowFlags.NoResize))
         {
             ImGui.TextColored(Theme.YellowMain, editFriendName);
             ImGui.Separator();
@@ -725,13 +725,13 @@ public sealed class MainWindow : Window
     {
         if (openConfirmModal)
         {
-            ImGui.OpenPopup("##ConfirmBulkPopup");
+            ImGui.OpenPopup("###ConfirmBulkPopup");
             openConfirmModal = false;
         }
 
         var open = true;
         ImGui.SetNextWindowSize(new Vector2(480, 360), ImGuiCond.Appearing);
-        if (ImGui.BeginPopupModal(L.T("Confirm Bulk Friend Removal##ConfirmBulkPopup", "Confirmar Remoção em Massa##ConfirmBulkPopup"), ref open, ImGuiWindowFlags.NoResize))
+        if (ImGui.BeginPopupModal(L.T("Confirm Bulk Friend Removal###ConfirmBulkPopup", "Confirmar Remoção em Massa###ConfirmBulkPopup"), ref open, ImGuiWindowFlags.NoResize))
         {
             ImGui.TextColored(Theme.RedDanger, L.T(
                 $"You are about to remove {pendingBatchTargets.Count} friend(s) from your Friend List:",

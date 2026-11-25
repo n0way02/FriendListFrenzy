@@ -2,7 +2,7 @@
   "Author": "n0way02",
   "Name": "FriendList Frenzy",
   "InternalName": "FriendListFrenzy",
-  "AssemblyVersion": "1.0.0.0",
+  "AssemblyVersion": "1.0.0.1",
   "Description": "Modern, enhanced FFXIV Friend List manager with instant search, custom groups, nicknames, color tags, notes, Last Seen tracking, protected favorites, and automated Bulk Friend Removal (select multiple friends and safely remove them one by one). Bilingual EN / PT-BR UI.",
   "ApplicableVersion": "any",
   "Punchline": "Enhanced Friend List with groups, notes, Last Seen & safe Bulk Friend Removal.",
