@@ -1,0 +1,26 @@
+[
+  {
+    "Author": "n0way02",
+    "Name": "FriendList Frenzy",
+    "InternalName": "FriendListFrenzy",
+    "AssemblyVersion": "1.0.0.0",
+    "Punchline": "Enhanced Friend List with groups, notes, Last Seen & safe Bulk Friend Removal.",
+    "Description": "Modern, enhanced FFXIV Friend List manager with instant search, custom groups, nicknames, color tags, notes, Last Seen tracking, protected favorites, and automated Bulk Friend Removal (select multiple friends and safely remove them one by one). Bilingual EN / PT-BR UI.",
+    "ApplicableVersion": "any",
+    "DalamudApiLevel": 15,
+    "RepoUrl": "https://github.com/n0way02/FriendListFrenzy",
+    "DownloadLinkInstall": "https://raw.githubusercontent.com/n0way02/FriendListFrenzy/main/releases/latest.zip",
+    "DownloadLinkTesting": "https://raw.githubusercontent.com/n0way02/FriendListFrenzy/main/releases/latest.zip",
+    "DownloadLinkUpdate": "https://raw.githubusercontent.com/n0way02/FriendListFrenzy/main/releases/latest.zip",
+    "IconUrl": "https://raw.githubusercontent.com/n0way02/FriendListFrenzy/main/images/icon.png",
+    "Tags": [
+      "Friend",
+      "FriendList",
+      "Social",
+      "Bulk",
+      "Remove",
+      "Groups",
+      "UI"
+    ]
+  }
+]
