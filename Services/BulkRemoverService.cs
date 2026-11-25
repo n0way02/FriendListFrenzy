@@ -41,22 +41,31 @@ public sealed class BulkRemovalLogItem
 
 /// <summary>
 /// Safely removes multiple selected friends one-by-one via FFXIV's native FriendList UI,
-/// ContextMenu, and SelectYesno confirmation — with strict name & ContentId safety checks.
+/// ContextMenu, and SelectYesno confirmation — with strict name & ContentId safety checks
+/// and full FriendList reload stabilization between every removal.
 /// </summary>
 public sealed unsafe class BulkRemoverService : IDisposable
 {
-    private const long StateTimeoutMs = 4_500;
+    private const long MenuTimeoutMs = 5_000;
+    private const long ListLoadTimeoutMs = 15_000;
+    private const long ListStableDurationMs = 750;
 
     private readonly Queue<BulkRemovalTarget> queue = new();
     private readonly List<BulkRemovalLogItem> log = new();
     private readonly List<string> removeMenuLabels = new();
 
+    private uint friendListMainCommandId = 29; // Official FFXIV MainCommand RowId for Friend List
     private BulkRemovalTarget? currentTarget;
     private BulkRemoveState state = BulkRemoveState.Idle;
     private BulkRemoveState resumeState = BulkRemoveState.Idle;
     private long stateEnteredAtMs;
     private long nextStepAtMs;
     private int currentRetries;
+
+    // Reload stabilization tracking
+    private int countBeforeRemoval;
+    private int lastObservedEntryCount = -1;
+    private long entryCountStableSinceMs;
 
     public BulkRemoveState State => state;
     public bool IsActive => state != BulkRemoveState.Idle;
@@ -71,7 +80,7 @@ public sealed unsafe class BulkRemoverService : IDisposable
 
     public BulkRemoverService()
     {
-        BuildLocalizedRemoveLabels();
+        BuildLocalizedLabelsAndCommand();
         Plugin.Framework.Update += OnFrameworkUpdate;
         Plugin.ClientState.Logout += OnLogout;
     }
@@ -87,22 +96,20 @@ public sealed unsafe class BulkRemoverService : IDisposable
         Cancel("Logged out.");
     }
 
-    private void BuildLocalizedRemoveLabels()
+    private void BuildLocalizedLabelsAndCommand()
     {
-        // Multilingual fallbacks (EN, JP, DE, FR, PT)
+        // Multilingual fallbacks (EN, JP, DE, FR)
         removeMenuLabels.Add("Remove from Friend List");
         removeMenuLabels.Add("Remove Friend");
         removeMenuLabels.Add("フレンドリストから削除");
         removeMenuLabels.Add("Aus der Freundesliste entfernen");
         removeMenuLabels.Add("Supprimer de la liste d'amis");
 
-        // Also pull exact game client localized strings from Lumina Addon sheet if present
         try
         {
             var addonSheet = Plugin.DataManager.GetExcelSheet<Addon>();
             if (addonSheet != null)
             {
-                // Row 3761 / 1456 etc. vary by patch, so scan for exact "Friend List" remove entries
                 foreach (var row in addonSheet)
                 {
                     var text = row.Text.ToString();
@@ -117,10 +124,27 @@ public sealed unsafe class BulkRemoverService : IDisposable
                     }
                 }
             }
+
+            var mainCmdSheet = Plugin.DataManager.GetExcelSheet<MainCommand>();
+            if (mainCmdSheet != null)
+            {
+                foreach (var row in mainCmdSheet)
+                {
+                    var name = row.Name.ToString();
+                    if (name.Equals("Friend List", StringComparison.OrdinalIgnoreCase)
+                        || name.Equals("フレンドリスト", StringComparison.Ordinal)
+                        || name.Equals("Freundesliste", StringComparison.OrdinalIgnoreCase)
+                        || name.Equals("Liste d'amis", StringComparison.OrdinalIgnoreCase))
+                    {
+                        friendListMainCommandId = row.RowId;
+                        break;
+                    }
+                }
+            }
         }
         catch
         {
-            // Fallbacks already populated
+            // Keep defaults
         }
     }
 
@@ -133,6 +157,7 @@ public sealed unsafe class BulkRemoverService : IDisposable
         RemovedCount = 0;
         FailedCount = 0;
         currentTarget = null;
+        ResetStabilityTracker();
 
         foreach (var f in targets)
         {
@@ -172,6 +197,7 @@ public sealed unsafe class BulkRemoverService : IDisposable
         state = resumeState == BulkRemoveState.Paused ? BulkRemoveState.OpeningFriendList : resumeState;
         stateEnteredAtMs = Environment.TickCount64;
         nextStepAtMs = Environment.TickCount64 + 300;
+        ResetStabilityTracker();
         StatusMessage = L.T("Resuming...", "Retomando...");
     }
 
@@ -191,6 +217,12 @@ public sealed unsafe class BulkRemoverService : IDisposable
         stateEnteredAtMs = Environment.TickCount64;
         nextStepAtMs = Environment.TickCount64 + delayMs;
         StatusMessage = message;
+    }
+
+    private void ResetStabilityTracker()
+    {
+        lastObservedEntryCount = -1;
+        entryCountStableSinceMs = Environment.TickCount64;
     }
 
     private void AddLog(string name, bool success, string message)
@@ -259,7 +291,87 @@ public sealed unsafe class BulkRemoverService : IDisposable
             currentRetries = 0;
         }
 
-        // Already removed?
+        // Open native Friend List window reliably even if completely closed
+        var addon = GetVisibleAddon("FriendList");
+        if (addon == null)
+        {
+            var uiModule = UIModule.Instance();
+            if (uiModule != null)
+            {
+                uiModule->ExecuteMainCommand(friendListMainCommandId);
+            }
+            else
+            {
+                var agent = AgentFriendlist.Instance();
+                if (agent != null) agent->Show();
+            }
+        }
+
+        ResetStabilityTracker();
+        Transition(BulkRemoveState.WaitingForListReady,
+            L.T($"Waiting for Friend List to load for {currentTarget.Name}...", $"Aguardando Lista de Amigos carregar para {currentTarget.Name}..."),
+            500);
+    }
+
+    private void HandleWaitingForListReady(long now)
+    {
+        if (currentTarget == null)
+        {
+            AdvanceToNextOrFinish();
+            return;
+        }
+
+        var addon = GetVisibleAddon("FriendList");
+        if (addon == null || !addon->IsReady)
+        {
+            if (now - stateEnteredAtMs > ListLoadTimeoutMs)
+            {
+                FailCurrentTarget(L.T("FriendList window did not open in time.", "Janela FriendList não abriu a tempo."));
+            }
+            return;
+        }
+
+        // Wait if any popup/context menu from previous action is still closing
+        if (GetVisibleAddon("ContextMenu") != null || GetVisibleAddon("SelectYesno") != null)
+            return;
+
+        var proxy = FriendListService.GetFriendProxy();
+        if (proxy == null) return;
+
+        // Ensure native FriendList filter is set to "All" (group 0) so grouped friends are always visible
+        if (proxy->FilterGroup != 0)
+        {
+            proxy->FilterGroup = 0;
+            proxy->ApplyFilters();
+            ResetStabilityTracker();
+            nextStepAtMs = now + 450;
+            return;
+        }
+
+        var currentCount = (int)proxy->EntryCount;
+        if (currentCount <= 0)
+        {
+            if (now - stateEnteredAtMs > ListLoadTimeoutMs)
+            {
+                FailCurrentTarget(L.T("Friend List stayed empty while loading.", "Lista de Amigos permaneceu vazia ao carregar."));
+            }
+            return;
+        }
+
+        // Track stability: wait until EntryCount stops changing for ListStableDurationMs
+        if (currentCount != lastObservedEntryCount)
+        {
+            lastObservedEntryCount = currentCount;
+            entryCountStableSinceMs = now;
+            return;
+        }
+
+        if (now - entryCountStableSinceMs < ListStableDurationMs)
+            return;
+
+        // List is loaded and stable! Refresh our mirror and check if target is still present.
+        Plugin.Friends.RefreshFromMemory();
+
         if (!Plugin.Friends.ContainsContentId(currentTarget.ContentId))
         {
             RemovedCount++;
@@ -269,46 +381,9 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        var agent = AgentFriendlist.Instance();
-        if (agent == null)
-        {
-            Cancel(L.T("AgentFriendlist unavailable.", "AgentFriendlist indisponível."));
-            return;
-        }
-
-        if (!agent->IsAddonShown())
-        {
-            agent->Show();
-        }
-
-        // Ensure native FriendList filter is set to "All" (group 0) so every friend is visible
-        var proxy = FriendListService.GetFriendProxy();
-        if (proxy != null && proxy->FilterGroup != 0)
-        {
-            proxy->FilterGroup = 0;
-            proxy->ApplyFilters();
-        }
-
-        Transition(BulkRemoveState.WaitingForListReady,
-            L.T($"Opening Friend List for {currentTarget.Name}...", $"Abrindo Lista de Amigos para {currentTarget.Name}..."),
-            350);
-    }
-
-    private void HandleWaitingForListReady(long now)
-    {
-        var addon = GetVisibleAddon("FriendList");
-        if (addon != null && addon->IsReady)
-        {
-            Transition(BulkRemoveState.OpeningContextMenu,
-                L.T($"Selecting {currentTarget?.Name}...", $"Selecionando {currentTarget?.Name}..."),
-                200);
-            return;
-        }
-
-        if (now - stateEnteredAtMs > StateTimeoutMs)
-        {
-            FailCurrentTarget(L.T("FriendList window did not open in time.", "Janela FriendList não abriu a tempo."));
-        }
+        Transition(BulkRemoveState.OpeningContextMenu,
+            L.T($"Selecting {currentTarget.Name}...", $"Selecionando {currentTarget.Name}..."),
+            150);
     }
 
     private void HandleOpeningContextMenu()
@@ -322,13 +397,29 @@ public sealed unsafe class BulkRemoverService : IDisposable
         var addon = GetVisibleAddon("FriendList");
         if (addon == null || !addon->IsReady)
         {
-            Transition(BulkRemoveState.OpeningFriendList, L.T("Re-opening Friend List...", "Reabrindo Lista de Amigos..."), 300);
+            Transition(BulkRemoveState.OpeningFriendList, L.T("Re-opening Friend List...", "Reabrindo Lista de Amigos..."), 350);
             return;
         }
+
+        var proxy = FriendListService.GetFriendProxy();
+        if (proxy == null) return;
+
+        countBeforeRemoval = (int)proxy->EntryCount;
 
         var rowIdx = Plugin.Friends.FindDisplayRowIndex(currentTarget.ContentId);
         if (rowIdx < 0)
         {
+            // Wait for reload instead of assuming removed if list is refreshing
+            if (currentRetries < 1)
+            {
+                currentRetries++;
+                ResetStabilityTracker();
+                Transition(BulkRemoveState.WaitingForListReady,
+                    L.T($"Waiting for {currentTarget.Name} to appear in list...", $"Aguardando {currentTarget.Name} aparecer na lista..."),
+                    600);
+                return;
+            }
+
             RemovedCount++;
             AddLog(currentTarget.Name, true, L.T("Not in Friend List anymore", "Não está mais na lista"));
             currentTarget = null;
@@ -399,14 +490,15 @@ public sealed unsafe class BulkRemoverService : IDisposable
             }
         }
 
-        if (now - stateEnteredAtMs > StateTimeoutMs)
+        if (now - stateEnteredAtMs > MenuTimeoutMs)
         {
             if (currentRetries < 1)
             {
                 currentRetries++;
-                Transition(BulkRemoveState.OpeningContextMenu,
+                ResetStabilityTracker();
+                Transition(BulkRemoveState.WaitingForListReady,
                     L.T($"Retrying menu for {currentTarget?.Name}...", $"Tentando novamente menu para {currentTarget?.Name}..."),
-                    300);
+                    400);
             }
             else
             {
@@ -437,19 +529,37 @@ public sealed unsafe class BulkRemoverService : IDisposable
                     vals[0].Int = 0; // 0 = Yes
                     yn->FireCallback(1, vals, true);
 
+                    ResetStabilityTracker();
                     Transition(BulkRemoveState.WaitingForRemovalVerify,
-                        L.T($"Waiting for server to remove {currentTarget.Name}...", $"Aguardando servidor remover {currentTarget.Name}..."),
-                        450);
+                        L.T($"Waiting for Friend List to finish reloading after removing {currentTarget.Name}...",
+                            $"Aguardando Lista de Amigos recarregar após remover {currentTarget.Name}..."),
+                        550);
                     return;
                 }
 
-                // Unrelated Yes/No prompt — refuse for safety!
+                // Dialog did not match target (e.g. list shifted while loading) -> close No and retry once after reload
+                var noVals = stackalloc AtkValue[1];
+                noVals[0].Type = AtkValueType.Int;
+                noVals[0].Int = 1; // 1 = No
+                yn->FireCallback(1, noVals, true);
+
+                if (currentRetries < 1)
+                {
+                    currentRetries++;
+                    ResetStabilityTracker();
+                    Transition(BulkRemoveState.WaitingForListReady,
+                        L.T($"List shifted; waiting for reload and retrying {currentTarget?.Name}...",
+                            $"Lista mudou durante carregamento; aguardando recarregar para tentar {currentTarget?.Name} novamente..."),
+                        800);
+                    return;
+                }
+
                 FailCurrentTarget(L.T("Safety abort: confirmation dialog did not match target name.", "Abortado por segurança: diálogo não corresponde ao nome do alvo."));
                 return;
             }
         }
 
-        if (now - stateEnteredAtMs > StateTimeoutMs)
+        if (now - stateEnteredAtMs > MenuTimeoutMs)
         {
             FailCurrentTarget(L.T("Confirmation dialog did not appear.", "Diálogo de confirmação não apareceu."));
         }
@@ -463,8 +573,36 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        if (!Plugin.Friends.ContainsContentId(currentTarget.ContentId))
+        // Wait until SelectYesno finishes closing
+        if (GetVisibleAddon("SelectYesno") != null)
+            return;
+
+        var proxy = FriendListService.GetFriendProxy();
+        if (proxy == null) return;
+
+        var currentCount = (int)proxy->EntryCount;
+        var stillPresent = Plugin.Friends.ContainsContentId(currentTarget.ContentId);
+
+        if (!stillPresent)
         {
+            // Wait until the server finishes repopulating the Friend List (avoid moving on while EntryCount is 0 or still streaming)
+            var expectedMinCount = Math.Max(0, countBeforeRemoval - 1);
+            if (expectedMinCount > 0 && currentCount < expectedMinCount)
+            {
+                if (now - stateEnteredAtMs <= ListLoadTimeoutMs)
+                    return;
+            }
+
+            if (currentCount != lastObservedEntryCount)
+            {
+                lastObservedEntryCount = currentCount;
+                entryCountStableSinceMs = now;
+                return;
+            }
+
+            if (now - entryCountStableSinceMs < ListStableDurationMs && now - stateEnteredAtMs <= ListLoadTimeoutMs)
+                return;
+
             RemovedCount++;
             AddLog(currentTarget.Name, true, L.T("Removed successfully", "Removido com sucesso"));
             Plugin.Friends.RefreshFromMemory();
@@ -477,9 +615,8 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        if (now - stateEnteredAtMs > StateTimeoutMs)
+        if (now - stateEnteredAtMs > ListLoadTimeoutMs)
         {
-            // Force refresh and move on
             Plugin.Friends.RequestRefresh();
             FailCurrentTarget(L.T("Timed out waiting for server confirmation.", "Tempo esgotado aguardando confirmação do servidor."));
         }

@@ -113,7 +113,7 @@ public sealed class MainWindow : Window
     {
         ImGui.TextColored(Theme.YellowMain, "FRIENDLIST FRENZY");
         ImGui.SameLine();
-        ImGui.TextColored(Theme.TextMuted, "v1.0.0.1  •");
+        ImGui.TextColored(Theme.TextMuted, "v1.0.0.2  •");
         ImGui.SameLine();
 
         var total = Plugin.Friends.TotalCount;
