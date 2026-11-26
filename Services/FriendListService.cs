@@ -25,6 +25,7 @@ public sealed unsafe class FriendListService : IDisposable
     public int OnlineCount { get; private set; }
     public bool HasLoadedData { get; private set; }
     public DateTime LastUpdatedLocal { get; private set; } = DateTime.MinValue;
+    public List<FriendEntry> Friends => GetSnapshot();
 
     public FriendListService()
     {

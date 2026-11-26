@@ -2,87 +2,105 @@ using System;
 using System.Collections.Generic;
 using System.Numerics;
 using Dalamud.Configuration;
+using FriendListFrenzy.Models;
+using FriendListFrenzy.Services;
 
 namespace FriendListFrenzy;
 
 [Serializable]
-public sealed class FriendGroup
-{
-    public string Id { get; set; } = Guid.NewGuid().ToString("N")[..8];
-    public string Name { get; set; } = "New Group";
-    public Vector4 Color { get; set; } = new(1.000f, 0.902f, 0.000f, 1.000f); // #FFE600
-}
-
-[Serializable]
-public sealed class FriendMeta
-{
-    public ulong ContentId { get; set; }
-    public string LastKnownName { get; set; } = string.Empty;
-    public string Nickname { get; set; } = string.Empty;
-    public string Note { get; set; } = string.Empty;
-    public string GroupId { get; set; } = string.Empty;
-    public bool IsProtected { get; set; }
-    public bool UseCustomColor { get; set; }
-    public Vector4 CustomColor { get; set; } = new(1.000f, 0.902f, 0.000f, 1.000f);
-    public DateTime FirstSeenUtc { get; set; } = DateTime.UtcNow;
-    public DateTime? LastSeenOnlineUtc { get; set; }
-}
-
-[Serializable]
 public sealed class Configuration : IPluginConfiguration
 {
-    public int Version { get; set; } = 1;
+    public int Version { get; set; } = 2;
 
-    /// <summary>Default English ("en"), toggleable to Portuguese ("pt").</summary>
+    /// <summary>"en" (default) or "pt"</summary>
     public string Language { get; set; } = "en";
 
-    /// <summary>Delay in milliseconds between each bulk friend removal (server-friendly pacing).</summary>
-    public int RemovalDelayMs { get; set; } = 1500;
+    /// <summary>Delay in ms between each bulk native FriendList operation (safe default 1000ms).</summary>
+    public int RemovalDelayMs { get; set; } = 1000;
 
-    /// <summary>Automatically close the native FriendList window when bulk removal finishes.</summary>
+    /// <summary>Close the native FriendList window when a bulk batch finishes.</summary>
     public bool CloseNativeListAfterBatch { get; set; } = true;
 
-    /// <summary>Show a chat summary when a bulk removal batch finishes.</summary>
+    /// <summary>Print a summary in FFXIV chat when bulk operations finish.</summary>
     public bool PrintChatSummary { get; set; } = true;
 
-    /// <summary>Custom friend groups.</summary>
-    public List<FriendGroup> Groups { get; set; } =
-    [
-        new() { Id = "favorites", Name = "Favorites", Color = new Vector4(1.000f, 0.902f, 0.000f, 1f) },
-        new() { Id = "fc",        Name = "Free Company", Color = new Vector4(0.486f, 0.165f, 0.910f, 1f) },
-        new() { Id = "static",    Name = "Static / Raid", Color = new Vector4(0.290f, 0.871f, 0.502f, 1f) },
-        new() { Id = "cleanup",   Name = "To Remove", Color = new Vector4(0.937f, 0.267f, 0.267f, 1f) },
-    ];
+    /// <summary>Show FC tag next to friend names.</summary>
+    public bool ShowFcTag { get; set; } = true;
 
-    /// <summary>Metadata keyed by Friend ContentId.</summary>
-    public Dictionary<ulong, FriendMeta> FriendMetadata { get; set; } = new();
+    /// <summary>Show custom nickname if set.</summary>
+    public bool ShowNickname { get; set; } = true;
 
-    public FriendMeta GetOrCreateMeta(ulong contentId, string name)
+    /// <summary>Show Last Seen column.</summary>
+    public bool ShowLastSeen { get; set; } = true;
+
+    /// <summary>Custom display names & colors for FFXIV's 7 native Friend Groups (keys 1..7).</summary>
+    public Dictionary<byte, NativeGroupCustomization> NativeGroups { get; set; } = new();
+
+    /// <summary>Legacy local groups kept for backwards JSON compatibility.</summary>
+    public List<FriendGroup> Groups { get; set; } = new();
+
+    /// <summary>Per-friend metadata keyed by ContentId.</summary>
+    public Dictionary<ulong, FriendMetadata> FriendsMeta { get; set; } = new();
+
+    public FriendMetadata GetOrCreateMeta(ulong contentId, string currentName)
     {
-        if (!FriendMetadata.TryGetValue(contentId, out var meta))
+        if (!FriendsMeta.TryGetValue(contentId, out var meta))
         {
-            meta = new FriendMeta
+            meta = new FriendMetadata
             {
                 ContentId = contentId,
-                LastKnownName = name,
+                LastKnownName = currentName,
                 FirstSeenUtc = DateTime.UtcNow,
             };
-            FriendMetadata[contentId] = meta;
+            FriendsMeta[contentId] = meta;
         }
-        else if (!string.IsNullOrWhiteSpace(name))
+        else if (!string.IsNullOrWhiteSpace(currentName))
         {
-            meta.LastKnownName = name;
+            meta.LastKnownName = currentName;
         }
 
         return meta;
     }
 
-    public FriendGroup? FindGroup(string? groupId)
+    public NativeGroupCustomization GetOrCreateNativeGroup(byte groupId)
     {
-        if (string.IsNullOrWhiteSpace(groupId)) return null;
-        foreach (var g in Groups)
-            if (g.Id == groupId) return g;
-        return null;
+        if (!NativeGroups.TryGetValue(groupId, out var custom))
+        {
+            var def = NativeFriendGroups.GetDef(groupId);
+            custom = new NativeGroupCustomization
+            {
+                CustomName = string.Empty,
+                Color = def?.DefaultColor ?? Vector4.One,
+                UseCustomColor = false,
+            };
+            NativeGroups[groupId] = custom;
+        }
+        return custom;
+    }
+
+    public string GetNativeGroupLabel(byte groupId, bool includeSymbol = true)
+    {
+        var def = NativeFriendGroups.GetDef(groupId);
+        if (def == null)
+            return L.T("Ungrouped", "Sem Grupo");
+
+        var customName = NativeGroups.TryGetValue(groupId, out var c) && !string.IsNullOrWhiteSpace(c.CustomName)
+            ? c.CustomName.Trim()
+            : L.T(def.Value.DefaultNameEn, def.Value.DefaultNamePt);
+
+        return includeSymbol ? $"{def.Value.Symbol} {customName}" : customName;
+    }
+
+    public Vector4 GetNativeGroupColor(byte groupId)
+    {
+        var def = NativeFriendGroups.GetDef(groupId);
+        if (def == null)
+            return new Vector4(0.62f, 0.58f, 0.72f, 1f);
+
+        if (NativeGroups.TryGetValue(groupId, out var c) && c.UseCustomColor)
+            return c.Color;
+
+        return def.Value.DefaultColor;
     }
 
     public void Save()

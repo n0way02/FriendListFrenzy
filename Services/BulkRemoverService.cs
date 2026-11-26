@@ -1,109 +1,112 @@
 using System;
 using System.Collections.Generic;
+using System.Diagnostics;
 using Dalamud.Memory;
 using Dalamud.Plugin.Services;
 using FFXIVClientStructs.FFXIV.Client.UI;
 using FFXIVClientStructs.FFXIV.Client.UI.Agent;
-using FFXIVClientStructs.FFXIV.Client.UI.Info;
 using FFXIVClientStructs.FFXIV.Component.GUI;
 using FriendListFrenzy.Models;
 using Lumina.Excel.Sheets;
 
 namespace FriendListFrenzy.Services;
 
-public enum BulkRemoveState
+public enum BulkEngineState
 {
     Idle,
     OpeningFriendList,
     WaitingForListReady,
     OpeningContextMenu,
     WaitingForContextMenu,
+    WaitingForGroupPicker,
     WaitingForConfirmDialog,
     WaitingForRemovalVerify,
+    WaitingForGroupVerify,
     CooldownBeforeNext,
-    Paused,
 }
 
-public sealed class BulkRemovalTarget
-{
-    public ulong ContentId { get; init; }
-    public string Name { get; init; } = string.Empty;
-    public string World { get; init; } = string.Empty;
-}
-
-public sealed class BulkRemovalLogItem
-{
-    public DateTime TimeLocal { get; init; } = DateTime.Now;
-    public string Name { get; init; } = string.Empty;
-    public bool Success { get; init; }
-    public string Message { get; init; } = string.Empty;
-}
-
-/// <summary>
-/// Safely removes multiple selected friends one-by-one via FFXIV's native FriendList UI,
-/// ContextMenu, and SelectYesno confirmation — with strict name & ContentId safety checks
-/// and full FriendList reload stabilization between every removal.
-/// </summary>
 public sealed unsafe class BulkRemoverService : IDisposable
 {
-    private const long MenuTimeoutMs = 5_000;
-    private const long ListLoadTimeoutMs = 15_000;
-    private const long ListStableDurationMs = 750;
+    private sealed class BulkTaskItem
+    {
+        public required ulong ContentId { get; init; }
+        public required string Name { get; init; }
+        public required BulkActionKind Action { get; init; }
+        public byte TargetGroup { get; init; }
+    }
 
-    private readonly Queue<BulkRemovalTarget> queue = new();
-    private readonly List<BulkRemovalLogItem> log = new();
-    private readonly List<string> removeMenuLabels = new();
+    private readonly Queue<BulkTaskItem> queue = new();
+    private readonly List<BulkActionLogEntry> actionLog = new();
+    private readonly HashSet<string> removeFriendLabels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> assignGroupLabels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<string> removeGroupLabels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Stopwatch clock = Stopwatch.StartNew();
 
-    private uint friendListMainCommandId = 29; // Official FFXIV MainCommand RowId for Friend List
-    private BulkRemovalTarget? currentTarget;
-    private BulkRemoveState state = BulkRemoveState.Idle;
-    private BulkRemoveState resumeState = BulkRemoveState.Idle;
-    private long stateEnteredAtMs;
+    private BulkEngineState state = BulkEngineState.Idle;
+    private BulkTaskItem? currentTarget;
     private long nextStepAtMs;
+    private long stateEnteredAtMs;
+    private uint friendListMainCommandId;
     private int currentRetries;
 
-    // Reload stabilization tracking
-    private int countBeforeRemoval;
+    // Stability tracking for FriendList reload after opening or removing a friend
     private int lastObservedEntryCount = -1;
     private long entryCountStableSinceMs;
+    private int countBeforeRemoval;
+    private string contextMenuSnapshot = string.Empty;
 
-    public BulkRemoveState State => state;
-    public bool IsActive => state != BulkRemoveState.Idle;
-    public bool IsPaused => state == BulkRemoveState.Paused;
-    public int TotalQueued { get; private set; }
-    public int RemovedCount { get; private set; }
+    private const long ListLoadTimeoutMs = 9000;
+    private const long MenuTimeoutMs = 4500;
+    private const long ListStableDurationMs = 450;
+
+    public bool IsRunning => state != BulkEngineState.Idle;
+    public bool IsPaused { get; private set; }
+    public BulkActionKind CurrentBatchKind { get; private set; } = BulkActionKind.None;
+    public byte CurrentBatchTargetGroup { get; private set; }
+    public int TotalInBatch { get; private set; }
+    public int SucceededCount { get; private set; }
     public int FailedCount { get; private set; }
     public int RemainingCount => queue.Count + (currentTarget != null ? 1 : 0);
-    public BulkRemovalTarget? CurrentTarget => currentTarget;
+    public string CurrentTargetName => currentTarget?.Name ?? string.Empty;
     public string StatusMessage { get; private set; } = string.Empty;
-    public IReadOnlyList<BulkRemovalLogItem> RecentLog => log;
+    public IReadOnlyList<BulkActionLogEntry> ActionLog => actionLog;
 
     public BulkRemoverService()
     {
-        BuildLocalizedLabelsAndCommand();
+        LoadLocalizedGameLabels();
         Plugin.Framework.Update += OnFrameworkUpdate;
-        Plugin.ClientState.Logout += OnLogout;
     }
 
     public void Dispose()
     {
         Plugin.Framework.Update -= OnFrameworkUpdate;
-        Plugin.ClientState.Logout -= OnLogout;
     }
 
-    private void OnLogout(int type, int code)
+    private void LoadLocalizedGameLabels()
     {
-        Cancel("Logged out.");
-    }
+        // Known multi-language fallbacks (EN / DE / FR / JP)
+        removeFriendLabels.Add("Remove from Friend List");
+        removeFriendLabels.Add("Remove Friend");
+        removeFriendLabels.Add("Aus der Freundesliste entfernen");
+        removeFriendLabels.Add("Retirer de la liste d'amis");
+        removeFriendLabels.Add("フレンドリストから削除");
 
-    private void BuildLocalizedLabelsAndCommand()
-    {
-        // Multilingual fallbacks (EN, JP, DE, FR)
-        removeMenuLabels.Add("Remove from Friend List");
-        removeMenuLabels.Add("Remove Friend");
-        removeMenuLabels.Add("フレンドリストから削除");
-        removeMenuLabels.Add("Aus der Freundesliste entfernen");
-        removeMenuLabels.Add("Supprimer de la liste d'amis");
+        assignGroupLabels.Add("Add to Friend Group");
+        assignGroupLabels.Add("Change Friend Group");
+        assignGroupLabels.Add("Assign to Friend Group");
+        assignGroupLabels.Add("Move to Friend Group");
+        assignGroupLabels.Add("Zu Freundesgruppe hinzufügen");
+        assignGroupLabels.Add("Freundesgruppe ändern");
+        assignGroupLabels.Add("Ajouter à un groupe d'amis");
+        assignGroupLabels.Add("Changer de groupe d'amis");
+        assignGroupLabels.Add("フレンドグループに追加");
+        assignGroupLabels.Add("フレンドグループを変更");
+
+        removeGroupLabels.Add("Remove from Friend Group");
+        removeGroupLabels.Add("Aus Freundesgruppe entfernen");
+        removeGroupLabels.Add("Retirer du groupe d'amis");
+        removeGroupLabels.Add("フレンドグループから削除");
+        removeGroupLabels.Add("フレンドグループから外す");
 
         try
         {
@@ -112,29 +115,49 @@ public sealed unsafe class BulkRemoverService : IDisposable
             {
                 foreach (var row in addonSheet)
                 {
-                    var text = row.Text.ToString();
-                    if (string.IsNullOrWhiteSpace(text) || text.Length > 48) continue;
-                    if (text.Contains("Remove from Friend List", StringComparison.OrdinalIgnoreCase)
-                        || text.Contains("フレンドリストから削除", StringComparison.Ordinal)
+                    var text = row.Text.ExtractText().Trim();
+                    if (string.IsNullOrEmpty(text)) continue;
+
+                    if (text.Contains("Remove from Friend", StringComparison.OrdinalIgnoreCase)
                         || text.Contains("Aus der Freundesliste entfernen", StringComparison.OrdinalIgnoreCase)
-                        || text.Contains("Supprimer de la liste d'amis", StringComparison.OrdinalIgnoreCase))
+                        || text.Contains("Retirer de la liste d'amis", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("フレンドリストから削除", StringComparison.Ordinal))
                     {
-                        if (!removeMenuLabels.Contains(text))
-                            removeMenuLabels.Insert(0, text);
+                        removeFriendLabels.Add(text);
+                    }
+                    else if (text.Contains("Add to Friend Group", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("Change Friend Group", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("Assign to Friend Group", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("Zu Freundesgruppe", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("Freundesgruppe ändern", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("groupe d'amis", StringComparison.OrdinalIgnoreCase) && !text.Contains("Retirer", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("フレンドグループに追加", StringComparison.Ordinal)
+                        || text.Contains("フレンドグループを変更", StringComparison.Ordinal))
+                    {
+                        assignGroupLabels.Add(text);
+                    }
+                    else if (text.Contains("Remove from Friend Group", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("Aus Freundesgruppe entfernen", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("Retirer du groupe d'amis", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("フレンドグループから削除", StringComparison.Ordinal)
+                        || text.Contains("フレンドグループから外す", StringComparison.Ordinal))
+                    {
+                        removeGroupLabels.Add(text);
                     }
                 }
             }
 
-            var mainCmdSheet = Plugin.DataManager.GetExcelSheet<MainCommand>();
-            if (mainCmdSheet != null)
+            // Locate MainCommand ID for "Friend List" so we can reliably open it via UIModule.ExecuteMainCommand
+            var mcSheet = Plugin.DataManager.GetExcelSheet<MainCommand>();
+            if (mcSheet != null)
             {
-                foreach (var row in mainCmdSheet)
+                foreach (var row in mcSheet)
                 {
-                    var name = row.Name.ToString();
+                    var name = row.Name.ExtractText().Trim();
                     if (name.Equals("Friend List", StringComparison.OrdinalIgnoreCase)
-                        || name.Equals("フレンドリスト", StringComparison.Ordinal)
                         || name.Equals("Freundesliste", StringComparison.OrdinalIgnoreCase)
-                        || name.Equals("Liste d'amis", StringComparison.OrdinalIgnoreCase))
+                        || name.Equals("Liste d'amis", StringComparison.OrdinalIgnoreCase)
+                        || name.Equals("フレンドリスト", StringComparison.Ordinal))
                     {
                         friendListMainCommandId = row.RowId;
                         break;
@@ -142,139 +165,194 @@ public sealed unsafe class BulkRemoverService : IDisposable
                 }
             }
         }
-        catch
+        catch (Exception ex)
         {
-            // Keep defaults
+            Plugin.Log.Warning(ex, "Failed to load localized Friend List labels.");
         }
     }
 
-    public void StartBatch(IEnumerable<FriendEntry> targets)
+    public void StartRemoveBatch(IEnumerable<FriendEntry> targets)
+        => StartBatchInternal(targets, BulkActionKind.RemoveFriend, 0);
+
+    public void StartSetGroupBatch(IEnumerable<FriendEntry> targets, byte targetNativeGroup)
     {
-        if (IsActive) return;
+        if (targetNativeGroup < 1 || targetNativeGroup > NativeFriendGroups.MaxGroupId)
+            return;
+        StartBatchInternal(targets, BulkActionKind.SetNativeGroup, targetNativeGroup);
+    }
+
+    public void StartClearGroupBatch(IEnumerable<FriendEntry> targets)
+        => StartBatchInternal(targets, BulkActionKind.ClearNativeGroup, 0);
+
+    private void StartBatchInternal(IEnumerable<FriendEntry> targets, BulkActionKind kind, byte targetGroup)
+    {
+        if (IsRunning) return;
 
         queue.Clear();
-        log.Clear();
-        RemovedCount = 0;
+        SucceededCount = 0;
         FailedCount = 0;
+        IsPaused = false;
         currentTarget = null;
-        ResetStabilityTracker();
+        CurrentBatchKind = kind;
+        CurrentBatchTargetGroup = targetGroup;
 
-        foreach (var f in targets)
+        foreach (var t in targets)
         {
-            var meta = Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name);
-            if (meta.IsProtected) continue;
-
-            queue.Enqueue(new BulkRemovalTarget
+            if (kind == BulkActionKind.RemoveFriend)
             {
-                ContentId = f.ContentId,
-                Name = f.Name,
-                World = f.HomeWorldName,
+                var meta = Plugin.Config.GetOrCreateMeta(t.ContentId, t.Name);
+                if (meta.IsProtected)
+                {
+                    AddLog(t.Name, kind, false, L.T("Skipped (Protected favorite)", "Ignorado (Favorito protegido)"));
+                    FailedCount++;
+                    continue;
+                }
+            }
+            else if (kind == BulkActionKind.SetNativeGroup && t.NativeGroup == targetGroup)
+            {
+                AddLog(t.Name, kind, true, L.T("Already in this group", "Já está neste grupo"));
+                SucceededCount++;
+                continue;
+            }
+            else if (kind == BulkActionKind.ClearNativeGroup && t.NativeGroup == 0)
+            {
+                AddLog(t.Name, kind, true, L.T("Already ungrouped", "Já está sem grupo"));
+                SucceededCount++;
+                continue;
+            }
+
+            queue.Enqueue(new BulkTaskItem
+            {
+                ContentId = t.ContentId,
+                Name = t.Name,
+                Action = kind,
+                TargetGroup = targetGroup,
             });
         }
 
-        TotalQueued = queue.Count;
-        if (TotalQueued == 0)
+        TotalInBatch = queue.Count;
+        if (TotalInBatch == 0)
         {
-            StatusMessage = L.T("No removable friends selected.", "Nenhum amigo removível selecionado.");
+            CurrentBatchKind = BulkActionKind.None;
+            StatusMessage = L.T("Nothing to change (all targets already matched or protected).", "Nada para alterar (todos os alvos já correspondem ou estão protegidos).");
             return;
         }
 
-        Transition(BulkRemoveState.OpeningFriendList,
-            L.T($"Starting bulk removal ({TotalQueued} friends)...", $"Iniciando remoção em massa ({TotalQueued} amigos)..."));
+        Transition(BulkEngineState.OpeningFriendList, GetBatchActionLabel(kind, targetGroup), 120);
     }
 
-    public void Pause()
+    public void TogglePause()
     {
-        if (!IsActive || IsPaused) return;
-        resumeState = state;
-        state = BulkRemoveState.Paused;
-        StatusMessage = L.T("Paused by user.", "Pausado pelo usuário.");
+        if (!IsRunning) return;
+        IsPaused = !IsPaused;
+        StatusMessage = IsPaused
+            ? L.T("Paused by user.", "Pausado pelo usuário.")
+            : L.T("Resuming...", "Retomando...");
     }
 
-    public void Resume()
+    public void Cancel()
     {
-        if (!IsPaused) return;
-        state = resumeState == BulkRemoveState.Paused ? BulkRemoveState.OpeningFriendList : resumeState;
-        stateEnteredAtMs = Environment.TickCount64;
-        nextStepAtMs = Environment.TickCount64 + 300;
-        ResetStabilityTracker();
-        StatusMessage = L.T("Resuming...", "Retomando...");
-    }
-
-    public void Cancel(string? reason = null)
-    {
-        if (!IsActive) return;
+        if (!IsRunning) return;
         queue.Clear();
         currentTarget = null;
-        state = BulkRemoveState.Idle;
-        StatusMessage = reason ?? L.T("Cancelled by user.", "Cancelado pelo usuário.");
-        AddLog("Batch", false, StatusMessage);
+        IsPaused = false;
+        state = BulkEngineState.Idle;
+        CurrentBatchKind = BulkActionKind.None;
+        StatusMessage = L.T(
+            $"Cancelled. Completed: {SucceededCount}, Failed: {FailedCount}.",
+            $"Cancelado. Concluídos: {SucceededCount}, Falhas: {FailedCount}.");
     }
 
-    private void Transition(BulkRemoveState next, string message, long delayMs = 0)
+    public void ClearLog() => actionLog.Clear();
+
+    public string GetBatchActionLabel(BulkActionKind kind, byte targetGroup) => kind switch
     {
-        state = next;
-        stateEnteredAtMs = Environment.TickCount64;
-        nextStepAtMs = Environment.TickCount64 + delayMs;
+        BulkActionKind.RemoveFriend => L.T("Bulk Friend Removal", "Remoção em Massa"),
+        BulkActionKind.SetNativeGroup => L.T(
+            $"Set In-Game Group -> {Plugin.Config.GetNativeGroupLabel(targetGroup)}",
+            $"Definir Grupo no Jogo -> {Plugin.Config.GetNativeGroupLabel(targetGroup)}"),
+        BulkActionKind.ClearNativeGroup => L.T("Remove from In-Game Group", "Remover do Grupo no Jogo"),
+        _ => L.T("Idle", "Ocioso"),
+    };
+
+    private void Transition(BulkEngineState nextState, string message, long delayMs = 0)
+    {
+        state = nextState;
         StatusMessage = message;
+        var now = clock.ElapsedMilliseconds;
+        stateEnteredAtMs = now;
+        nextStepAtMs = now + delayMs;
     }
 
     private void ResetStabilityTracker()
     {
         lastObservedEntryCount = -1;
-        entryCountStableSinceMs = Environment.TickCount64;
+        entryCountStableSinceMs = clock.ElapsedMilliseconds;
     }
 
-    private void AddLog(string name, bool success, string message)
+    private void AddLog(string name, BulkActionKind kind, bool success, string message)
     {
-        log.Insert(0, new BulkRemovalLogItem
+        actionLog.Insert(0, new BulkActionLogEntry
         {
-            TimeLocal = DateTime.Now,
-            Name = name,
+            TimestampUtc = DateTime.UtcNow,
+            FriendName = name,
+            Action = kind,
             Success = success,
             Message = message,
         });
-        if (log.Count > 200) log.RemoveAt(log.Count - 1);
+        if (actionLog.Count > 250)
+            actionLog.RemoveRange(250, actionLog.Count - 250);
     }
 
     private void OnFrameworkUpdate(IFramework framework)
     {
-        if (state == BulkRemoveState.Idle || state == BulkRemoveState.Paused) return;
+        if (state == BulkEngineState.Idle || IsPaused) return;
+        if (!Plugin.ClientState.IsLoggedIn)
+        {
+            Cancel();
+            return;
+        }
 
-        var now = Environment.TickCount64;
+        var now = clock.ElapsedMilliseconds;
         if (now < nextStepAtMs) return;
 
         try
         {
             switch (state)
             {
-                case BulkRemoveState.OpeningFriendList:
+                case BulkEngineState.OpeningFriendList:
                     HandleOpeningFriendList();
                     break;
-                case BulkRemoveState.WaitingForListReady:
+                case BulkEngineState.WaitingForListReady:
                     HandleWaitingForListReady(now);
                     break;
-                case BulkRemoveState.OpeningContextMenu:
+                case BulkEngineState.OpeningContextMenu:
                     HandleOpeningContextMenu();
                     break;
-                case BulkRemoveState.WaitingForContextMenu:
+                case BulkEngineState.WaitingForContextMenu:
                     HandleWaitingForContextMenu(now);
                     break;
-                case BulkRemoveState.WaitingForConfirmDialog:
+                case BulkEngineState.WaitingForGroupPicker:
+                    HandleWaitingForGroupPicker(now);
+                    break;
+                case BulkEngineState.WaitingForConfirmDialog:
                     HandleWaitingForConfirmDialog(now);
                     break;
-                case BulkRemoveState.WaitingForRemovalVerify:
+                case BulkEngineState.WaitingForRemovalVerify:
                     HandleWaitingForRemovalVerify(now);
                     break;
-                case BulkRemoveState.CooldownBeforeNext:
+                case BulkEngineState.WaitingForGroupVerify:
+                    HandleWaitingForGroupVerify(now);
+                    break;
+                case BulkEngineState.CooldownBeforeNext:
                     AdvanceToNextOrFinish();
                     break;
             }
         }
         catch (Exception ex)
         {
-            Plugin.Log.Error(ex, "[FriendListFrenzy] Bulk remover error");
-            FailCurrentTarget($"Error: {ex.Message}");
+            Plugin.Log.Error(ex, "Error in BulkRemoverService state machine.");
+            FailCurrentTarget(L.T("Unexpected error while automating Friend List.", "Erro inesperado ao automatizar Lista de Amigos."));
         }
     }
 
@@ -291,12 +369,11 @@ public sealed unsafe class BulkRemoverService : IDisposable
             currentRetries = 0;
         }
 
-        // Open native Friend List window reliably even if completely closed
         var addon = GetVisibleAddon("FriendList");
         if (addon == null)
         {
             var uiModule = UIModule.Instance();
-            if (uiModule != null)
+            if (uiModule != null && friendListMainCommandId != 0)
             {
                 uiModule->ExecuteMainCommand(friendListMainCommandId);
             }
@@ -308,9 +385,9 @@ public sealed unsafe class BulkRemoverService : IDisposable
         }
 
         ResetStabilityTracker();
-        Transition(BulkRemoveState.WaitingForListReady,
-            L.T($"Waiting for Friend List to load for {currentTarget.Name}...", $"Aguardando Lista de Amigos carregar para {currentTarget.Name}..."),
-            500);
+        Transition(BulkEngineState.WaitingForListReady,
+            L.T($"Waiting for Friend List ({currentTarget.Name})...", $"Aguardando Lista de Amigos ({currentTarget.Name})..."),
+            450);
     }
 
     private void HandleWaitingForListReady(long now)
@@ -331,20 +408,19 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        // Wait if any popup/context menu from previous action is still closing
-        if (GetVisibleAddon("ContextMenu") != null || GetVisibleAddon("SelectYesno") != null)
+        if (GetVisibleAddon("ContextMenu") != null || GetVisibleAddon("ContextIconMenu") != null || GetVisibleAddon("SelectYesno") != null)
             return;
 
         var proxy = FriendListService.GetFriendProxy();
         if (proxy == null) return;
 
-        // Ensure native FriendList filter is set to "All" (group 0) so grouped friends are always visible
+        // Always reset native FriendList filter to "All" (0) so every friend is reachable
         if (proxy->FilterGroup != 0)
         {
             proxy->FilterGroup = 0;
             proxy->ApplyFilters();
             ResetStabilityTracker();
-            nextStepAtMs = now + 450;
+            nextStepAtMs = now + 400;
             return;
         }
 
@@ -358,7 +434,6 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        // Track stability: wait until EntryCount stops changing for ListStableDurationMs
         if (currentCount != lastObservedEntryCount)
         {
             lastObservedEntryCount = currentCount;
@@ -369,21 +444,47 @@ public sealed unsafe class BulkRemoverService : IDisposable
         if (now - entryCountStableSinceMs < ListStableDurationMs)
             return;
 
-        // List is loaded and stable! Refresh our mirror and check if target is still present.
         Plugin.Friends.RefreshFromMemory();
 
         if (!Plugin.Friends.ContainsContentId(currentTarget.ContentId))
         {
-            RemovedCount++;
-            AddLog(currentTarget.Name, true, L.T("Already removed", "Já removido"));
+            if (currentTarget.Action == BulkActionKind.RemoveFriend)
+            {
+                SucceededCount++;
+                AddLog(currentTarget.Name, currentTarget.Action, true, L.T("Already removed", "Já removido"));
+            }
+            else
+            {
+                FailedCount++;
+                AddLog(currentTarget.Name, currentTarget.Action, false, L.T("Friend no longer in list", "Amigo não está mais na lista"));
+            }
             currentTarget = null;
-            Transition(BulkRemoveState.CooldownBeforeNext, L.T("Moving to next...", "Indo para o próximo..."), 250);
+            Transition(BulkEngineState.CooldownBeforeNext, L.T("Moving to next...", "Indo para o próximo..."), 200);
             return;
         }
 
-        Transition(BulkRemoveState.OpeningContextMenu,
+        // Check if native group already matches desired state
+        var liveGroup = GetLiveNativeGroup(currentTarget.ContentId);
+        if (currentTarget.Action == BulkActionKind.SetNativeGroup && liveGroup == currentTarget.TargetGroup)
+        {
+            SucceededCount++;
+            AddLog(currentTarget.Name, currentTarget.Action, true, L.T("Already in target group", "Já está no grupo destino"));
+            currentTarget = null;
+            Transition(BulkEngineState.CooldownBeforeNext, L.T("Moving to next...", "Indo para o próximo..."), 150);
+            return;
+        }
+        if (currentTarget.Action == BulkActionKind.ClearNativeGroup && liveGroup == 0)
+        {
+            SucceededCount++;
+            AddLog(currentTarget.Name, currentTarget.Action, true, L.T("Already ungrouped", "Já está sem grupo"));
+            currentTarget = null;
+            Transition(BulkEngineState.CooldownBeforeNext, L.T("Moving to next...", "Indo para o próximo..."), 150);
+            return;
+        }
+
+        Transition(BulkEngineState.OpeningContextMenu,
             L.T($"Selecting {currentTarget.Name}...", $"Selecionando {currentTarget.Name}..."),
-            150);
+            120);
     }
 
     private void HandleOpeningContextMenu()
@@ -397,7 +498,7 @@ public sealed unsafe class BulkRemoverService : IDisposable
         var addon = GetVisibleAddon("FriendList");
         if (addon == null || !addon->IsReady)
         {
-            Transition(BulkRemoveState.OpeningFriendList, L.T("Re-opening Friend List...", "Reabrindo Lista de Amigos..."), 350);
+            Transition(BulkEngineState.OpeningFriendList, L.T("Re-opening Friend List...", "Reabrindo Lista de Amigos..."), 350);
             return;
         }
 
@@ -409,21 +510,17 @@ public sealed unsafe class BulkRemoverService : IDisposable
         var rowIdx = Plugin.Friends.FindDisplayRowIndex(currentTarget.ContentId);
         if (rowIdx < 0)
         {
-            // Wait for reload instead of assuming removed if list is refreshing
             if (currentRetries < 1)
             {
                 currentRetries++;
                 ResetStabilityTracker();
-                Transition(BulkRemoveState.WaitingForListReady,
-                    L.T($"Waiting for {currentTarget.Name} to appear in list...", $"Aguardando {currentTarget.Name} aparecer na lista..."),
-                    600);
+                Transition(BulkEngineState.WaitingForListReady,
+                    L.T($"Waiting for {currentTarget.Name} to appear...", $"Aguardando {currentTarget.Name} aparecer..."),
+                    550);
                 return;
             }
 
-            RemovedCount++;
-            AddLog(currentTarget.Name, true, L.T("Not in Friend List anymore", "Não está mais na lista"));
-            currentTarget = null;
-            Transition(BulkRemoveState.CooldownBeforeNext, L.T("Next friend...", "Próximo amigo..."), 300);
+            FailCurrentTarget(L.T("Could not locate row in Friend List.", "Não foi possível localizar linha na Lista de Amigos."));
             return;
         }
 
@@ -435,13 +532,19 @@ public sealed unsafe class BulkRemoverService : IDisposable
         values[1].Int = rowIdx;
         addon->FireCallback(2, values, true);
 
-        Transition(BulkRemoveState.WaitingForContextMenu,
-            L.T($"Opening menu for {currentTarget.Name} (row {rowIdx})...", $"Abrindo menu para {currentTarget.Name} (linha {rowIdx})..."),
-            220);
+        Transition(BulkEngineState.WaitingForContextMenu,
+            L.T($"Opening menu for {currentTarget.Name}...", $"Abrindo menu para {currentTarget.Name}..."),
+            200);
     }
 
     private void HandleWaitingForContextMenu(long now)
     {
+        if (currentTarget == null)
+        {
+            AdvanceToNextOrFinish();
+            return;
+        }
+
         var cmPtr = Plugin.GameGui.GetAddonByName("ContextMenu", 1);
         if (cmPtr != nint.Zero)
         {
@@ -450,6 +553,7 @@ public sealed unsafe class BulkRemoverService : IDisposable
             {
                 var entriesCount = (int)cm->AtkValues[0].UInt;
                 var foundIdx = -1;
+                var allEntries = new List<string>(entriesCount);
 
                 for (var i = 0; i < entriesCount; i++)
                 {
@@ -459,15 +563,24 @@ public sealed unsafe class BulkRemoverService : IDisposable
                     if (strPtr == null) continue;
 
                     var text = MemoryHelper.ReadSeStringNullTerminated((nint)strPtr).TextValue.Trim();
-                    if (IsRemoveFriendLabel(text))
+                    allEntries.Add(text);
+
+                    var matched = currentTarget.Action switch
                     {
+                        BulkActionKind.RemoveFriend => IsRemoveFriendLabel(text),
+                        BulkActionKind.SetNativeGroup => IsAssignGroupLabel(text),
+                        BulkActionKind.ClearNativeGroup => IsRemoveGroupLabel(text),
+                        _ => false,
+                    };
+
+                    if (matched && foundIdx < 0)
                         foundIdx = i;
-                        break;
-                    }
                 }
 
                 if (foundIdx >= 0)
                 {
+                    contextMenuSnapshot = string.Join("|", allEntries);
+
                     var vals = stackalloc AtkValue[3];
                     vals[0].Type = AtkValueType.Int;
                     vals[0].Int = 0;
@@ -477,15 +590,37 @@ public sealed unsafe class BulkRemoverService : IDisposable
                     vals[2].Int = 0;
                     cm->FireCallback(3, vals, true);
 
-                    Transition(BulkRemoveState.WaitingForConfirmDialog,
-                        L.T($"Confirming removal of {currentTarget?.Name}...", $"Confirmando remoção de {currentTarget?.Name}..."),
-                        250);
+                    if (currentTarget.Action == BulkActionKind.RemoveFriend)
+                    {
+                        Transition(BulkEngineState.WaitingForConfirmDialog,
+                            L.T($"Confirming removal of {currentTarget.Name}...", $"Confirmando remoção de {currentTarget.Name}..."),
+                            220);
+                    }
+                    else if (currentTarget.Action == BulkActionKind.SetNativeGroup)
+                    {
+                        Transition(BulkEngineState.WaitingForGroupPicker,
+                            L.T($"Picking group {Plugin.Config.GetNativeGroupLabel(currentTarget.TargetGroup)} for {currentTarget.Name}...",
+                                $"Escolhendo grupo {Plugin.Config.GetNativeGroupLabel(currentTarget.TargetGroup)} para {currentTarget.Name}..."),
+                            180);
+                    }
+                    else
+                    {
+                        Transition(BulkEngineState.WaitingForGroupVerify,
+                            L.T($"Removing {currentTarget.Name} from in-game group...", $"Removendo {currentTarget.Name} do grupo no jogo..."),
+                            350);
+                    }
                     return;
                 }
 
-                // Close unexpected ContextMenu
+                Plugin.Log.Debug($"[FriendListFrenzy] ContextMenu entries for {currentTarget.Name} ({currentTarget.Action}): {string.Join(" | ", allEntries)}");
                 cm->Close(true);
-                FailCurrentTarget(L.T("'Remove from Friend List' option not found in menu.", "Opção 'Remover da Lista de Amigos' não encontrada no menu."));
+                FailCurrentTarget(currentTarget.Action switch
+                {
+                    BulkActionKind.RemoveFriend => L.T("'Remove from Friend List' not found in menu.", "Opção 'Remover da Lista de Amigos' não encontrada."),
+                    BulkActionKind.SetNativeGroup => L.T("'Add/Change Friend Group' not found in menu.", "Opção 'Adicionar/Alterar Grupo' não encontrada."),
+                    BulkActionKind.ClearNativeGroup => L.T("'Remove from Friend Group' not found in menu.", "Opção 'Remover do Grupo' não encontrada."),
+                    _ => L.T("Menu option not found.", "Opção do menu não encontrada."),
+                });
                 return;
             }
         }
@@ -496,14 +631,137 @@ public sealed unsafe class BulkRemoverService : IDisposable
             {
                 currentRetries++;
                 ResetStabilityTracker();
-                Transition(BulkRemoveState.WaitingForListReady,
-                    L.T($"Retrying menu for {currentTarget?.Name}...", $"Tentando novamente menu para {currentTarget?.Name}..."),
-                    400);
+                Transition(BulkEngineState.WaitingForListReady,
+                    L.T($"Retrying menu for {currentTarget.Name}...", $"Tentando menu novamente para {currentTarget.Name}..."),
+                    350);
             }
             else
             {
                 FailCurrentTarget(L.T("Context menu did not open.", "Menu de contexto não abriu."));
             }
+        }
+    }
+
+    private void HandleWaitingForGroupPicker(long now)
+    {
+        if (currentTarget == null)
+        {
+            AdvanceToNextOrFinish();
+            return;
+        }
+
+        var iconIdx = Math.Clamp(currentTarget.TargetGroup - 1, 0, NativeFriendGroups.MaxGroupId - 1);
+
+        // Primary path: FFXIV opens ContextIconMenu with the 7 Friend Group icons (0..6 = Star..Club)
+        var iconMenu = GetVisibleAddon("ContextIconMenu");
+        if (iconMenu != null && iconMenu->IsReady)
+        {
+            var vals = stackalloc AtkValue[5];
+            vals[0].Type = AtkValueType.Int; vals[0].Int = 0;
+            vals[1].Type = AtkValueType.Int; vals[1].Int = iconIdx;
+            vals[2].Type = AtkValueType.Int; vals[2].Int = 0;
+            vals[3].Type = AtkValueType.Int; vals[3].Int = 0;
+            vals[4].Type = AtkValueType.Int; vals[4].Int = 0;
+            iconMenu->FireCallback(5, vals, true);
+
+            Transition(BulkEngineState.WaitingForGroupVerify,
+                L.T($"Applying group to {currentTarget.Name}...", $"Aplicando grupo para {currentTarget.Name}..."),
+                350);
+            return;
+        }
+
+        // Fallback path: if FFXIV rendered a submenu ContextMenu instead of ContextIconMenu
+        var cmPtr = Plugin.GameGui.GetAddonByName("ContextMenu", 1);
+        if (cmPtr != nint.Zero)
+        {
+            var cm = (AddonContextMenu*)cmPtr.Address;
+            if (cm != null && cm->IsVisible && cm->IsReady)
+            {
+                var entriesCount = (int)cm->AtkValues[0].UInt;
+                var entries = new List<string>(entriesCount);
+                for (var i = 0; i < entriesCount; i++)
+                {
+                    var valIdx = i + 8;
+                    if (valIdx >= cm->AtkValuesCount) break;
+                    var strPtr = cm->AtkValues[valIdx].String.Value;
+                    if (strPtr == null) continue;
+                    entries.Add(MemoryHelper.ReadSeStringNullTerminated((nint)strPtr).TextValue.Trim());
+                }
+
+                var snap = string.Join("|", entries);
+                if (!string.Equals(snap, contextMenuSnapshot, StringComparison.Ordinal) && entriesCount >= iconIdx + 1 && entriesCount <= 9)
+                {
+                    var vals = stackalloc AtkValue[3];
+                    vals[0].Type = AtkValueType.Int; vals[0].Int = 0;
+                    vals[1].Type = AtkValueType.Int; vals[1].Int = iconIdx;
+                    vals[2].Type = AtkValueType.Int; vals[2].Int = 0;
+                    cm->FireCallback(3, vals, true);
+
+                    Transition(BulkEngineState.WaitingForGroupVerify,
+                        L.T($"Applying group to {currentTarget.Name}...", $"Aplicando grupo para {currentTarget.Name}..."),
+                        350);
+                    return;
+                }
+            }
+        }
+
+        if (now - stateEnteredAtMs > MenuTimeoutMs)
+        {
+            FailCurrentTarget(L.T("Friend Group icon picker did not open.", "Seletor de ícones de Grupo não abriu."));
+        }
+    }
+
+    private void HandleWaitingForGroupVerify(long now)
+    {
+        if (currentTarget == null)
+        {
+            AdvanceToNextOrFinish();
+            return;
+        }
+
+        // Handle unexpected SelectYesno if game ever prompts during group removal
+        var ynPtr = Plugin.GameGui.GetAddonByName("SelectYesno", 1);
+        if (ynPtr != nint.Zero)
+        {
+            var yn = (AddonSelectYesno*)ynPtr.Address;
+            if (yn != null && yn->IsVisible && yn->IsReady)
+            {
+                var vals = stackalloc AtkValue[1];
+                vals[0].Type = AtkValueType.Int;
+                vals[0].Int = 0; // Yes
+                yn->FireCallback(1, vals, true);
+                nextStepAtMs = now + 350;
+                return;
+            }
+        }
+
+        if (GetVisibleAddon("ContextMenu") != null || GetVisibleAddon("ContextIconMenu") != null)
+            return;
+
+        Plugin.Friends.RefreshFromMemory();
+        var liveGroup = GetLiveNativeGroup(currentTarget.ContentId);
+        var expectedGroup = currentTarget.Action == BulkActionKind.ClearNativeGroup ? (byte)0 : currentTarget.TargetGroup;
+
+        if (liveGroup == expectedGroup)
+        {
+            SucceededCount++;
+            var msg = expectedGroup == 0
+                ? L.T("Removed from in-game group", "Removido do grupo no jogo")
+                : L.T($"Moved to {Plugin.Config.GetNativeGroupLabel(expectedGroup)}", $"Movido para {Plugin.Config.GetNativeGroupLabel(expectedGroup)}");
+            AddLog(currentTarget.Name, currentTarget.Action, true, msg);
+            currentTarget = null;
+
+            var delay = Math.Clamp(Plugin.Config.RemovalDelayMs, 500, 5000);
+            Transition(BulkEngineState.CooldownBeforeNext,
+                L.T($"Updated! Waiting {delay / 1000.0:0.0}s...", $"Atualizado! Aguardando {delay / 1000.0:0.0}s..."),
+                delay);
+            return;
+        }
+
+        if (now - stateEnteredAtMs > ListLoadTimeoutMs)
+        {
+            Plugin.Friends.RequestRefresh();
+            FailCurrentTarget(L.T("Timed out waiting for group update.", "Tempo esgotado aguardando atualização do grupo."));
         }
     }
 
@@ -521,7 +779,7 @@ public sealed unsafe class BulkRemoverService : IDisposable
                     promptText = MemoryHelper.ReadSeStringNullTerminated((nint)yn->AtkValues[0].String.Value).TextValue;
                 }
 
-                // STRICT SAFETY CHECK: Only confirm Yes if the prompt explicitly names our target friend!
+                // STRICT SAFETY CHECK: Only confirm Yes if the prompt explicitly names our target friend
                 if (currentTarget != null && promptText.Contains(currentTarget.Name, StringComparison.OrdinalIgnoreCase))
                 {
                     var vals = stackalloc AtkValue[1];
@@ -530,14 +788,13 @@ public sealed unsafe class BulkRemoverService : IDisposable
                     yn->FireCallback(1, vals, true);
 
                     ResetStabilityTracker();
-                    Transition(BulkRemoveState.WaitingForRemovalVerify,
-                        L.T($"Waiting for Friend List to finish reloading after removing {currentTarget.Name}...",
-                            $"Aguardando Lista de Amigos recarregar após remover {currentTarget.Name}..."),
+                    Transition(BulkEngineState.WaitingForRemovalVerify,
+                        L.T($"Waiting for Friend List reload after removing {currentTarget.Name}...",
+                            $"Aguardando recarregar após remover {currentTarget.Name}..."),
                         550);
                     return;
                 }
 
-                // Dialog did not match target (e.g. list shifted while loading) -> close No and retry once after reload
                 var noVals = stackalloc AtkValue[1];
                 noVals[0].Type = AtkValueType.Int;
                 noVals[0].Int = 1; // 1 = No
@@ -547,14 +804,14 @@ public sealed unsafe class BulkRemoverService : IDisposable
                 {
                     currentRetries++;
                     ResetStabilityTracker();
-                    Transition(BulkRemoveState.WaitingForListReady,
-                        L.T($"List shifted; waiting for reload and retrying {currentTarget?.Name}...",
-                            $"Lista mudou durante carregamento; aguardando recarregar para tentar {currentTarget?.Name} novamente..."),
+                    Transition(BulkEngineState.WaitingForListReady,
+                        L.T($"List shifted; retrying {currentTarget?.Name}...",
+                            $"Lista mudou; tentando {currentTarget?.Name} novamente..."),
                         800);
                     return;
                 }
 
-                FailCurrentTarget(L.T("Safety abort: confirmation dialog did not match target name.", "Abortado por segurança: diálogo não corresponde ao nome do alvo."));
+                FailCurrentTarget(L.T("Safety abort: confirmation dialog did not match target name.", "Abortado por segurança: diálogo não corresponde ao alvo."));
                 return;
             }
         }
@@ -573,7 +830,6 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        // Wait until SelectYesno finishes closing
         if (GetVisibleAddon("SelectYesno") != null)
             return;
 
@@ -585,7 +841,6 @@ public sealed unsafe class BulkRemoverService : IDisposable
 
         if (!stillPresent)
         {
-            // Wait until the server finishes repopulating the Friend List (avoid moving on while EntryCount is 0 or still streaming)
             var expectedMinCount = Math.Max(0, countBeforeRemoval - 1);
             if (expectedMinCount > 0 && currentCount < expectedMinCount)
             {
@@ -603,14 +858,14 @@ public sealed unsafe class BulkRemoverService : IDisposable
             if (now - entryCountStableSinceMs < ListStableDurationMs && now - stateEnteredAtMs <= ListLoadTimeoutMs)
                 return;
 
-            RemovedCount++;
-            AddLog(currentTarget.Name, true, L.T("Removed successfully", "Removido com sucesso"));
+            SucceededCount++;
+            AddLog(currentTarget.Name, currentTarget.Action, true, L.T("Removed successfully", "Removido com sucesso"));
             Plugin.Friends.RefreshFromMemory();
             currentTarget = null;
 
-            var delay = Math.Clamp(Plugin.Config.RemovalDelayMs, 600, 5000);
-            Transition(BulkRemoveState.CooldownBeforeNext,
-                L.T($"Removed! Waiting {delay / 1000.0:0.0}s before next...", $"Removido! Aguardando {delay / 1000.0:0.0}s para o próximo..."),
+            var delay = Math.Clamp(Plugin.Config.RemovalDelayMs, 500, 5000);
+            Transition(BulkEngineState.CooldownBeforeNext,
+                L.T($"Removed! Waiting {delay / 1000.0:0.0}s...", $"Removido! Aguardando {delay / 1000.0:0.0}s..."),
                 delay);
             return;
         }
@@ -627,12 +882,12 @@ public sealed unsafe class BulkRemoverService : IDisposable
         if (currentTarget != null)
         {
             FailedCount++;
-            AddLog(currentTarget.Name, false, reason);
+            AddLog(currentTarget.Name, currentTarget.Action, false, reason);
             currentTarget = null;
         }
 
-        var delay = Math.Clamp(Plugin.Config.RemovalDelayMs, 600, 5000);
-        Transition(BulkRemoveState.CooldownBeforeNext, reason, delay);
+        var delay = Math.Clamp(Plugin.Config.RemovalDelayMs, 500, 5000);
+        Transition(BulkEngineState.CooldownBeforeNext, reason, delay);
     }
 
     private void AdvanceToNextOrFinish()
@@ -643,13 +898,15 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        Transition(BulkRemoveState.OpeningFriendList, L.T("Preparing next friend...", "Preparando próximo amigo..."), 100);
+        Transition(BulkEngineState.OpeningFriendList, L.T("Preparing next friend...", "Preparando próximo amigo..."), 100);
     }
 
     private void FinishBatch()
     {
-        state = BulkRemoveState.Idle;
+        var finishedKind = CurrentBatchKind;
+        state = BulkEngineState.Idle;
         currentTarget = null;
+        CurrentBatchKind = BulkActionKind.None;
 
         if (Plugin.Config.CloseNativeListAfterBatch)
         {
@@ -661,9 +918,9 @@ public sealed unsafe class BulkRemoverService : IDisposable
         Plugin.Friends.RequestRefresh();
         Plugin.Friends.RefreshFromMemory();
 
-        StatusMessage = L.T(
-            $"Done! Removed: {RemovedCount}, Skipped/Failed: {FailedCount}.",
-            $"Concluído! Removidos: {RemovedCount}, Ignorados/Falhas: {FailedCount}.");
+        StatusMessage = finishedKind == BulkActionKind.RemoveFriend
+            ? L.T($"Done! Removed: {SucceededCount}, Skipped/Failed: {FailedCount}.", $"Concluído! Removidos: {SucceededCount}, Ignorados/Falhas: {FailedCount}.")
+            : L.T($"Done! Updated: {SucceededCount}, Failed: {FailedCount}.", $"Concluído! Atualizados: {SucceededCount}, Falhas: {FailedCount}.");
 
         if (Plugin.Config.PrintChatSummary)
         {
@@ -671,21 +928,50 @@ public sealed unsafe class BulkRemoverService : IDisposable
         }
     }
 
+    private static byte GetLiveNativeGroup(ulong contentId)
+    {
+        foreach (var f in Plugin.Friends.Friends)
+        {
+            if (f.ContentId == contentId)
+                return f.NativeGroup;
+        }
+        return 0;
+    }
+
     private bool IsRemoveFriendLabel(string text)
     {
         if (string.IsNullOrWhiteSpace(text)) return false;
+        if (removeFriendLabels.Contains(text)) return true;
 
-        foreach (var label in removeMenuLabels)
-        {
-            if (text.Equals(label, StringComparison.OrdinalIgnoreCase))
-                return true;
-        }
-
-        return text.Contains("Remove from Friend", StringComparison.OrdinalIgnoreCase)
+        return text.Contains("Remove from Friend List", StringComparison.OrdinalIgnoreCase)
             || text.Contains("Remove Friend", StringComparison.OrdinalIgnoreCase)
             || text.Contains("フレンドリストから削除", StringComparison.Ordinal)
             || text.Contains("Freundesliste entfernen", StringComparison.OrdinalIgnoreCase)
             || text.Contains("liste d'amis", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsAssignGroupLabel(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        if (assignGroupLabels.Contains(text)) return true;
+
+        return (text.Contains("Friend Group", StringComparison.OrdinalIgnoreCase) && !text.Contains("Remove", StringComparison.OrdinalIgnoreCase))
+            || (text.Contains("Freundesgruppe", StringComparison.OrdinalIgnoreCase) && !text.Contains("entfernen", StringComparison.OrdinalIgnoreCase))
+            || (text.Contains("groupe d'amis", StringComparison.OrdinalIgnoreCase) && !text.Contains("Retirer", StringComparison.OrdinalIgnoreCase))
+            || text.Contains("フレンドグループに追加", StringComparison.Ordinal)
+            || text.Contains("フレンドグループを変更", StringComparison.Ordinal);
+    }
+
+    private bool IsRemoveGroupLabel(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return false;
+        if (removeGroupLabels.Contains(text)) return true;
+
+        return text.Contains("Remove from Friend Group", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Aus Freundesgruppe entfernen", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Retirer du groupe d'amis", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("フレンドグループから削除", StringComparison.Ordinal)
+            || text.Contains("フレンドグループから外す", StringComparison.Ordinal);
     }
 
     private static AtkUnitBase* GetVisibleAddon(string name)

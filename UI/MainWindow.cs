@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Numerics;
 using Dalamud.Bindings.ImGui;
+using Dalamud.Interface.Utility;
 using Dalamud.Interface.Windowing;
 using FriendListFrenzy.Models;
 using FriendListFrenzy.Services;
@@ -12,601 +13,873 @@ namespace FriendListFrenzy.UI;
 
 public sealed class MainWindow : Window
 {
-    private readonly HashSet<ulong> selectedIds = new();
+    private const string KofiUrl = "https://ko-fi.com/n0way02";
+    private const string EditModalId = "###EditFriendModal";
+    private const string ConfirmModalId = "###ConfirmBulkModal";
 
-    // Filters & sorting
+    private readonly HashSet<ulong> selectedIds = new();
     private string searchQuery = string.Empty;
     private int statusFilter; // 0=All, 1=Online, 2=Offline, 3=Protected
-    private string groupFilterId = "__all__"; // "__all__", "__none__", or group.Id
-    private int sortMode; // 0=Online First, 1=Name A-Z, 2=World, 3=Last Seen, 4=Group
+    private int nativeGroupFilter = -1; // -1=All, 0=Ungrouped, 1..7=NativeGroup
+    private int sortMode; // 0=Online+Name, 1=Name, 2=World, 3=LastSeen, 4=NativeGroup
+    private byte bulkTargetGroup = NativeFriendGroups.Star;
 
-    // Edit friend modal state
+    // Cross-tab jump helper (from Native Groups tab -> Friends tab)
+    private bool requestFocusFriendsTab;
+
+    // Groups tab "Move All To" target per source group (1..7)
+    private readonly byte[] moveAllTargets = [0, 2, 1, 1, 1, 1, 1, 1];
+
+    // Edit Friend modal state
+    private bool openEditModal;
     private ulong editingContentId;
     private string editFriendName = string.Empty;
     private string editNickname = string.Empty;
     private string editNote = string.Empty;
-    private string editGroupId = string.Empty;
+    private byte editNativeGroup;
+    private byte editOriginalNativeGroup;
     private bool editProtected;
     private bool editUseColor;
     private Vector4 editColor = Theme.YellowMain;
-    private bool openEditModal;
 
-    // Bulk confirm modal state
+    // Confirm Bulk Action modal state
     private bool openConfirmModal;
+    private BulkActionKind pendingBatchKind = BulkActionKind.None;
+    private byte pendingBatchGroup;
     private List<FriendEntry> pendingBatchTargets = new();
 
-    // New group form
-    private string newGroupName = string.Empty;
-    private Vector4 newGroupColor = Theme.YellowMain;
+    private int pushedColors;
+    private int pushedVars;
 
-    public MainWindow() : base("FriendList Frenzy###FriendListFrenzyMain", ImGuiWindowFlags.NoScrollbar)
+    public MainWindow()
+        : base("FriendList Frenzy###FriendListFrenzyMain", ImGuiWindowFlags.NoScrollbar | ImGuiWindowFlags.NoScrollWithMouse)
     {
+        Size = new Vector2(960, 660);
+        SizeCondition = ImGuiCond.FirstUseEver;
         SizeConstraints = new WindowSizeConstraints
         {
-            MinimumSize = new Vector2(880, 560),
-            MaximumSize = new Vector2(1900, 1200),
+            MinimumSize = new Vector2(760, 500),
+            MaximumSize = new Vector2(1800, 1200),
         };
-        Size = new Vector2(1060, 680);
-        SizeCondition = ImGuiCond.FirstUseEver;
+    }
+
+    public override void PreDraw()
+    {
+        pushedColors = Theme.PushTheme();
+        pushedVars = Theme.PushStyleVars();
+    }
+
+    public override void PostDraw()
+    {
+        if (pushedVars > 0) ImGui.PopStyleVar(pushedVars);
+        if (pushedColors > 0) ImGui.PopStyleColor(pushedColors);
+        pushedVars = 0;
+        pushedColors = 0;
     }
 
     public override void Draw()
     {
-        var pushedColors = Theme.PushTheme();
-        var pushedVars = Theme.PushStyleVars();
+        DrawHeaderBar();
+        DrawActiveBatchBanner();
 
-        try
+        if (ImGui.BeginTabBar("##FlfMainTabs"))
         {
-            DrawHeaderBar();
+            var friendsTabFlags = requestFocusFriendsTab ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None;
+            requestFocusFriendsTab = false;
 
-            if (Plugin.BulkRemover.IsActive)
+            if (ImGui.BeginTabItem(L.T("Friends###TabFriends", "Amigos###TabFriends"), friendsTabFlags))
             {
-                ImGui.Spacing();
-                DrawActiveBatchBanner();
+                DrawFriendsTab();
+                ImGui.EndTabItem();
             }
 
-            ImGui.Spacing();
-
-            if (ImGui.BeginTabBar("##FLFTabs"))
+            if (ImGui.BeginTabItem(L.T("Native Groups###TabGroups", "Grupos do Jogo###TabGroups")))
             {
-                if (ImGui.BeginTabItem(L.T("Friends", "Amigos")))
-                {
-                    DrawFriendsTab();
-                    ImGui.EndTabItem();
-                }
-
-                var bulkTabLabel = Plugin.BulkRemover.IsActive
-                    ? L.T($"Bulk Remove ({Plugin.BulkRemover.RemainingCount})###BulkTab", $"Remoção em Massa ({Plugin.BulkRemover.RemainingCount})###BulkTab")
-                    : L.T("Bulk Remove###BulkTab", "Remoção em Massa###BulkTab");
-
-                if (ImGui.BeginTabItem(bulkTabLabel))
-                {
-                    DrawBulkRemoveTab();
-                    ImGui.EndTabItem();
-                }
-
-                if (ImGui.BeginTabItem(L.T("Groups", "Grupos")))
-                {
-                    DrawGroupsTab();
-                    ImGui.EndTabItem();
-                }
-
-                if (ImGui.BeginTabItem(L.T("Settings", "Configurações")))
-                {
-                    DrawSettingsTab();
-                    ImGui.EndTabItem();
-                }
-
-                ImGui.EndTabBar();
+                DrawGroupsTab();
+                ImGui.EndTabItem();
             }
 
-            DrawEditFriendModal();
-            DrawConfirmBulkModal();
+            var queueLabel = Plugin.BulkRemover.IsRunning
+                ? L.T($"Bulk Queue ({Plugin.BulkRemover.RemainingCount})###TabQueue", $"Fila ({Plugin.BulkRemover.RemainingCount})###TabQueue")
+                : L.T("Bulk Queue & Log###TabQueue", "Fila & Log###TabQueue");
+
+            if (ImGui.BeginTabItem(queueLabel))
+            {
+                DrawBulkQueueTab();
+                ImGui.EndTabItem();
+            }
+
+            if (ImGui.BeginTabItem(L.T("Settings###TabSettings", "Configurações###TabSettings")))
+            {
+                DrawSettingsTab();
+                ImGui.EndTabItem();
+            }
+
+            ImGui.EndTabBar();
         }
-        finally
-        {
-            ImGui.PopStyleVar(pushedVars);
-            ImGui.PopStyleColor(pushedColors);
-        }
+
+        DrawEditFriendModal();
+        DrawConfirmBulkModal();
     }
 
     private void DrawHeaderBar()
     {
+        var scale = ImGuiHelpers.GlobalScale;
+        var friends = Plugin.Friends.Friends;
+        var online = friends.Count(f => f.IsOnline);
+        var total = friends.Count;
+        var grouped = friends.Count(f => f.NativeGroup > 0);
+        var protectedCount = friends.Count(f => Plugin.Config.FriendsMeta.TryGetValue(f.ContentId, out var m) && m.IsProtected);
+
+        // Brand title + stat pills on the left
+        ImGui.AlignTextToFramePadding();
         ImGui.TextColored(Theme.YellowMain, "FRIENDLIST FRENZY");
-        ImGui.SameLine();
-        ImGui.TextColored(Theme.TextMuted, "v1.0.0.3  •");
-        ImGui.SameLine();
-
-        var total = Plugin.Friends.TotalCount;
-        var online = Plugin.Friends.OnlineCount;
-        ImGui.TextColored(Theme.TextWhite, $"{total} / 200");
-        ImGui.SameLine();
-        ImGui.TextColored(Theme.GreenOnline, $"({online} {L.T("online", "online")})");
-
-        // Right-aligned Support Me + Refresh + Language toggle
-        var supportW = 98f;
-        var refreshW = 92f;
-        var langW = 68f;
-        var rightOffset = ImGui.GetContentRegionAvail().X - (supportW + refreshW + langW + 18f);
-        if (rightOffset > 0) ImGui.SameLine(ImGui.GetCursorPosX() + rightOffset);
-        else ImGui.SameLine();
-
-        ImGui.PushStyleColor(ImGuiCol.Button, new Vector4(0.95f, 0.32f, 0.38f, 0.90f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(1.00f, 0.44f, 0.49f, 1.00f));
-        ImGui.PushStyleColor(ImGuiCol.ButtonActive, new Vector4(0.80f, 0.22f, 0.28f, 1.00f));
-        if (ImGui.Button(L.T("♥ Support Me", "♥ Apoiar"), new Vector2(supportW, 0)))
+        ImGui.SameLine(0, 12f * scale);
+        UiControls.DrawPillBadge(L.T($"● {online} Online", $"● {online} Online"), Theme.GreenOnline, true);
+        ImGui.SameLine(0, 6f * scale);
+        UiControls.DrawPillBadge(L.T($"{total} Total", $"{total} Total"), Theme.TextLight);
+        ImGui.SameLine(0, 6f * scale);
+        UiControls.DrawPillBadge(L.T($"★ {grouped} Grouped", $"★ {grouped} em Grupos"), Theme.PurpleBright);
+        if (protectedCount > 0)
         {
-            try { Process.Start(new ProcessStartInfo("https://ko-fi.com/n0way02") { UseShellExecute = true }); } catch { }
-        }
-        ImGui.PopStyleColor(3);
-        if (ImGui.IsItemHovered())
-        {
-            ImGui.SetTooltip("Support me on Ko-fi\nhttps://ko-fi.com/n0way02");
-            if (ImGui.IsMouseClicked(ImGuiMouseButton.Right))
-                ImGui.SetClipboardText("https://ko-fi.com/n0way02");
+            ImGui.SameLine(0, 6f * scale);
+            UiControls.DrawPillBadge(L.T($"♥ {protectedCount} Protected", $"♥ {protectedCount} Protegidos"), Theme.YellowMain);
         }
 
-        ImGui.SameLine();
-        if (ImGui.Button(L.T("Refresh", "Atualizar"), new Vector2(refreshW, 0)))
+        // Right-aligned utility buttons: Refresh | EN/PT-BR | ♥ Support Me
+        var refreshText = L.T("Refresh", "Atualizar");
+        var langText = L.IsPt ? "PT-BR" : "EN";
+        var kofiText = L.T("♥ Support Me", "♥ Apoie");
+
+        var padX = ImGui.GetStyle().FramePadding.X * 2f;
+        var spacing = ImGui.GetStyle().ItemSpacing.X;
+        var refreshW = ImGui.CalcTextSize(refreshText).X + padX + 4f * scale;
+        var langW = ImGui.CalcTextSize(langText).X + padX + 4f * scale;
+        var kofiW = ImGui.CalcTextSize(kofiText).X + padX + 6f * scale;
+        var totalRightW = refreshW + langW + kofiW + spacing * 2f;
+
+        var rightX = ImGui.GetWindowContentRegionMax().X - totalRightW;
+        if (rightX > ImGui.GetCursorPosX())
+            ImGui.SameLine(rightX);
+        else
+            ImGui.SameLine();
+
+        ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.BgElevated);
+        if (ImGui.Button($"{refreshText}##HdrRefresh", new Vector2(refreshW, 0)))
         {
             Plugin.Friends.RequestRefresh();
             Plugin.Friends.RefreshFromMemory();
         }
-
         ImGui.SameLine();
-        if (ImGui.Button(L.IsPt ? "PT / EN" : "EN / PT", new Vector2(langW, 0)))
+        if (ImGui.Button($"{langText}##HdrLang", new Vector2(langW, 0)))
         {
             Plugin.Config.Language = L.IsPt ? "en" : "pt";
             Plugin.Config.Save();
         }
+        ImGui.PopStyleColor(2);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(L.T("Switch language (EN / PT-BR)", "Alternar idioma (EN / PT-BR)"));
 
-        ImGui.Separator();
+        ImGui.SameLine();
+        ImGui.PushStyleColor(ImGuiCol.Button, Theme.YellowMain);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, new Vector4(1f, 0.94f, 0.35f, 1f));
+        ImGui.PushStyleColor(ImGuiCol.Text, Theme.BgDark);
+        if (ImGui.Button($"{kofiText}##HdrKofi", new Vector2(kofiW, 0)))
+        {
+            try { Process.Start(new ProcessStartInfo(KofiUrl) { UseShellExecute = true }); }
+            catch { /* ignore */ }
+        }
+        ImGui.PopStyleColor(3);
+        if (ImGui.IsItemHovered())
+            ImGui.SetTooltip(KofiUrl);
+
+        ImGui.Dummy(new Vector2(0, 4f * scale));
     }
 
     private void DrawActiveBatchBanner()
     {
-        var br = Plugin.BulkRemover;
-        ImGui.BeginChild("##ActiveBatchBanner", new Vector2(0, 62f), true, ImGuiWindowFlags.NoScrollbar);
+        var bulk = Plugin.BulkRemover;
+        if (!bulk.IsRunning) return;
 
-        var done = br.RemovedCount + br.FailedCount;
-        var frac = br.TotalQueued > 0 ? (float)done / br.TotalQueued : 0f;
+        var scale = ImGuiHelpers.GlobalScale;
+        var accent = bulk.CurrentBatchKind == BulkActionKind.RemoveFriend ? Theme.RedDanger : Theme.YellowMain;
 
-        ImGui.TextColored(Theme.YellowMain, br.IsPaused
-            ? L.T("BULK REMOVAL PAUSED", "REMOÇÃO EM MASSA PAUSADA")
-            : L.T("BULK REMOVAL IN PROGRESS", "REMOÇÃO EM MASSA EM ANDAMENTO"));
-        ImGui.SameLine();
-        ImGui.TextColored(Theme.TextMuted, $"— {br.StatusMessage}");
-
-        var btnW = 90f;
-        var rightOffset = ImGui.GetContentRegionAvail().X - (btnW * 2 + 12f);
-        if (rightOffset > 0) ImGui.SameLine(ImGui.GetCursorPosX() + rightOffset);
-        else ImGui.SameLine();
-
-        if (br.IsPaused)
+        using (UiCard.Begin("", new Vector4(0.14f, 0.04f, 0.28f, 1f), accent))
         {
-            if (ImGui.Button(L.T("Resume", "Retomar"), new Vector2(btnW, 0))) br.Resume();
-        }
-        else
-        {
-            if (ImGui.Button(L.T("Pause", "Pausar"), new Vector2(btnW, 0))) br.Pause();
-        }
+            var processed = bulk.SucceededCount + bulk.FailedCount;
+            var total = Math.Max(1, bulk.TotalInBatch);
+            var progress = Math.Clamp((float)processed / total, 0f, 1f);
 
-        ImGui.SameLine();
-        ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
-        if (ImGui.Button(L.T("Cancel", "Cancelar"), new Vector2(btnW, 0))) br.Cancel();
-        ImGui.PopStyleColor();
+            ImGui.TextColored(accent, $"● {bulk.GetBatchActionLabel(bulk.CurrentBatchKind, bulk.CurrentBatchTargetGroup)}");
+            ImGui.SameLine();
+            ImGui.TextColored(Theme.TextLight, $"  {bulk.StatusMessage}");
 
-        ImGui.ProgressBar(frac, new Vector2(-1, 16f), $"{done} / {br.TotalQueued}  ({L.T("Removed", "Removidos")}: {br.RemovedCount})");
-        ImGui.EndChild();
+            var btnW = 86f * scale;
+            var rightX = UiCard.ContentRightEdge - ImGui.GetWindowPos().X - (btnW * 2f + 8f * scale);
+            if (rightX > ImGui.GetCursorPosX())
+                ImGui.SameLine(rightX);
+            else
+                ImGui.SameLine();
+
+            if (ImGui.Button(bulk.IsPaused ? L.T("Resume", "Retomar") : L.T("Pause", "Pausar"), new Vector2(btnW, 0)))
+                bulk.TogglePause();
+            ImGui.SameLine();
+            ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.RedDanger);
+            if (ImGui.Button(L.T("Cancel", "Cancelar"), new Vector2(btnW, 0)))
+                bulk.Cancel();
+            ImGui.PopStyleColor(2);
+
+            ImGui.ProgressBar(progress, new Vector2(UiCard.InnerWidth, 16f * scale),
+                $"{processed}/{bulk.TotalInBatch}  (OK: {bulk.SucceededCount}, {L.T("Err", "Falha")}: {bulk.FailedCount})");
+        }
     }
 
     private void DrawFriendsTab()
     {
-        var allFriends = Plugin.Friends.GetSnapshot();
+        var scale = ImGuiHelpers.GlobalScale;
+        var allFriends = Plugin.Friends.Friends.ToList();
 
-        // Remove stale selections no longer on friend list
+        // Prune stale selections if friends were removed
         if (selectedIds.Count > 0)
         {
-            var liveSet = new HashSet<ulong>(allFriends.Select(f => f.ContentId));
-            selectedIds.RemoveWhere(id => !liveSet.Contains(id));
+            var liveIds = allFriends.Select(f => f.ContentId).ToHashSet();
+            selectedIds.RemoveWhere(id => !liveIds.Contains(id));
         }
 
-        if (allFriends.Count == 0)
+        if (!Plugin.ClientState.IsLoggedIn)
         {
             ImGui.Spacing();
-            ImGui.TextColored(Theme.YellowMain, L.T(
-                "No friend list data loaded yet.",
-                "Nenhum dado da Lista de Amigos carregado ainda."));
-            ImGui.TextColored(Theme.TextMuted, L.T(
-                "Click 'Refresh' above or open your in-game Friend List once to sync.",
-                "Clique em 'Atualizar' acima ou abra sua Lista de Amigos no jogo uma vez para sincronizar."));
+            using (UiCard.Begin())
+            {
+                UiControls.InsetNote(L.T("Log in to a character to view and manage your Friend List.", "Entre em um personagem para visualizar e gerenciar sua Lista de Amigos."), Theme.YellowMain);
+            }
             return;
         }
 
-        // Row 1: Search + Status + Group + Sort
-        ImGui.SetNextItemWidth(250f);
-        ImGui.InputTextWithHint("##SearchFriends",
-            L.T("Search name, nickname, world, FC, note...", "Buscar nome, apelido, mundo, FC, nota..."),
-            ref searchQuery, 128);
-
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(120f);
-        string[] statusOpts =
-        [
-            L.T("All Status", "Todos"),
-            L.T("Online", "Online"),
-            L.T("Offline", "Offline"),
-            L.T("Protected ★", "Protegidos ★")
-        ];
-        ImGui.Combo("##StatusFilter", ref statusFilter, statusOpts, statusOpts.Length);
-
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(155f);
-        var groupLabel = groupFilterId switch
+        // ── Card 1: Search, Filters & Sort ──
+        using (UiCard.Begin())
         {
-            "__all__" => L.T("All Groups", "Todos os Grupos"),
-            "__none__" => L.T("Ungrouped", "Sem Grupo"),
-            _ => Plugin.Config.FindGroup(groupFilterId)?.Name ?? L.T("All Groups", "Todos os Grupos"),
-        };
-        if (ImGui.BeginCombo("##GroupFilter", groupLabel))
-        {
-            if (ImGui.Selectable(L.T("All Groups", "Todos os Grupos"), groupFilterId == "__all__"))
-                groupFilterId = "__all__";
-            if (ImGui.Selectable(L.T("Ungrouped", "Sem Grupo"), groupFilterId == "__none__"))
-                groupFilterId = "__none__";
-            ImGui.Separator();
-            foreach (var g in Plugin.Config.Groups)
+            var availW = UiCard.InnerWidth;
+
+            // Row 1: Search + Native Group Filter + Sort
+            var groupComboW = 195f * scale;
+            var sortComboW = 155f * scale;
+            var searchW = MathF.Max(160f * scale, availW - groupComboW - sortComboW - 16f * scale);
+
+            ImGui.SetNextItemWidth(searchW);
+            ImGui.InputTextWithHint("##FlfSearch", L.T("Search name, nickname, world, FC, location, note...", "Buscar nome, apelido, mundo, FC, local, nota..."), ref searchQuery, 128);
+
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(groupComboW);
+            var groupPreview = nativeGroupFilter switch
             {
-                if (ImGui.Selectable(g.Name, groupFilterId == g.Id))
-                    groupFilterId = g.Id;
+                -1 => L.T($"All Groups ({allFriends.Count})", $"Todos os Grupos ({allFriends.Count})"),
+                0 => L.T($"○ Ungrouped ({allFriends.Count(f => f.NativeGroup == 0)})", $"○ Sem Grupo ({allFriends.Count(f => f.NativeGroup == 0)})"),
+                _ => $"{Plugin.Config.GetNativeGroupLabel((byte)nativeGroupFilter)} ({allFriends.Count(f => f.NativeGroup == nativeGroupFilter)})",
+            };
+
+            if (ImGui.BeginCombo("##FlfGroupFilter", groupPreview))
+            {
+                if (ImGui.Selectable(L.T($"All Groups ({allFriends.Count})", $"Todos os Grupos ({allFriends.Count})"), nativeGroupFilter == -1))
+                    nativeGroupFilter = -1;
+                if (ImGui.Selectable(L.T($"○ Ungrouped ({allFriends.Count(f => f.NativeGroup == 0)})", $"○ Sem Grupo ({allFriends.Count(f => f.NativeGroup == 0)})"), nativeGroupFilter == 0))
+                    nativeGroupFilter = 0;
+
+                ImGui.Separator();
+                foreach (var g in NativeFriendGroups.All)
+                {
+                    var cnt = allFriends.Count(f => f.NativeGroup == g.Id);
+                    var col = Plugin.Config.GetNativeGroupColor(g.Id);
+                    ImGui.PushStyleColor(ImGuiCol.Text, col);
+                    if (ImGui.Selectable($"{Plugin.Config.GetNativeGroupLabel(g.Id)} ({cnt})##gf_{g.Id}", nativeGroupFilter == g.Id))
+                        nativeGroupFilter = g.Id;
+                    ImGui.PopStyleColor();
+                }
+                ImGui.EndCombo();
             }
-            ImGui.EndCombo();
+
+            ImGui.SameLine();
+            ImGui.SetNextItemWidth(sortComboW);
+            string[] sortLabels =
+            [
+                L.T("Sort: Online", "Ordem: Online"),
+                L.T("Sort: Name A-Z", "Ordem: Nome A-Z"),
+                L.T("Sort: World", "Ordem: Mundo"),
+                L.T("Sort: Last Seen", "Ordem: Visto por último"),
+                L.T("Sort: Game Group", "Ordem: Grupo do Jogo"),
+            ];
+            ImGui.Combo("##FlfSort", ref sortMode, sortLabels, sortLabels.Length);
+
+            // Row 2: Status Filter Pills + Clear Filters
+            ImGui.Dummy(new Vector2(0, 2f * scale));
+            DrawFilterPill(L.T("All", "Todos"), 0);
+            ImGui.SameLine();
+            DrawFilterPill(L.T("Online", "Online"), 1);
+            ImGui.SameLine();
+            DrawFilterPill(L.T("Offline", "Offline"), 2);
+            ImGui.SameLine();
+            DrawFilterPill(L.T("★ Protected", "★ Protegidos"), 3);
+
+            if (!string.IsNullOrEmpty(searchQuery) || statusFilter != 0 || nativeGroupFilter != -1)
+            {
+                ImGui.SameLine(0, 12f * scale);
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
+                if (ImGui.SmallButton(L.T("× Reset Filters", "× Limpar Filtros")))
+                {
+                    searchQuery = string.Empty;
+                    statusFilter = 0;
+                    nativeGroupFilter = -1;
+                }
+                ImGui.PopStyleColor();
+            }
         }
 
-        ImGui.SameLine();
-        ImGui.SetNextItemWidth(145f);
-        string[] sortOpts =
-        [
-            L.T("Sort: Online First", "Ordem: Online"),
-            L.T("Sort: Name A-Z", "Ordem: Nome A-Z"),
-            L.T("Sort: World", "Ordem: Servidor"),
-            L.T("Sort: Last Seen", "Ordem: Visto por último"),
-            L.T("Sort: Group", "Ordem: Grupo"),
-        ];
-        ImGui.Combo("##SortMode", ref sortMode, sortOpts, sortOpts.Length);
-
-        // Apply filters
         var filtered = FilterAndSort(allFriends);
 
-        // Row 2: Bulk Selection Toolbar
-        ImGui.Spacing();
-        if (ImGui.SmallButton(L.T("Select Visible", "Selecionar Visíveis")))
+        // ── Card 2: Bulk Operations Toolbar (synced with FFXIV Friend List!) ──
+        using (UiCard.Begin("", Theme.BgSurface, selectedIds.Count > 0 ? Theme.YellowMain : Theme.BorderSoft))
         {
-            foreach (var f in filtered)
-            {
-                var meta = Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name);
-                if (!meta.IsProtected) selectedIds.Add(f.ContentId);
-            }
-        }
-        ImGui.SameLine();
-        if (ImGui.SmallButton(L.T("Select Offline", "Selecionar Offline")))
-        {
-            foreach (var f in filtered)
-            {
-                if (f.IsOnline) continue;
-                var meta = Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name);
-                if (!meta.IsProtected) selectedIds.Add(f.ContentId);
-            }
-        }
-        ImGui.SameLine();
-        if (ImGui.SmallButton(L.T("Clear Selection", "Limpar Seleção")))
-        {
-            selectedIds.Clear();
-        }
+            var isBusy = Plugin.BulkRemover.IsRunning;
 
-        ImGui.SameLine();
-        ImGui.TextColored(Theme.TextMuted, $"  |  {L.T("Showing", "Mostrando")}: {filtered.Count}/{allFriends.Count}");
-
-        if (selectedIds.Count > 0)
-        {
+            // Selection controls
+            ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgPanel);
+            if (ImGui.Button(L.T($"Select Visible ({filtered.Count})", $"Selecionar Visíveis ({filtered.Count})")))
+            {
+                foreach (var f in filtered)
+                    selectedIds.Add(f.ContentId);
+            }
             ImGui.SameLine();
-            ImGui.TextColored(Theme.YellowMain, $"  •  {selectedIds.Count} {L.T("selected", "selecionados")}");
+            if (ImGui.Button(L.T("Clear", "Limpar")))
+                selectedIds.Clear();
+            ImGui.PopStyleColor();
 
-            var removeBtnLabel = L.T($"Remove Selected ({selectedIds.Count})", $"Remover Selecionados ({selectedIds.Count})");
-            var btnW = MathF.Max(190f, ImGui.CalcTextSize(removeBtnLabel).X + 24f);
-            var rightPos = ImGui.GetContentRegionAvail().X - btnW;
-            if (rightPos > 0) ImGui.SameLine(ImGui.GetCursorPosX() + rightPos);
-            else ImGui.SameLine();
+            ImGui.SameLine(0, 10f * scale);
+            UiControls.DrawPillBadge(
+                L.T($"{selectedIds.Count} selected", $"{selectedIds.Count} selecionado(s)"),
+                selectedIds.Count > 0 ? Theme.YellowMain : Theme.TextMuted,
+                selectedIds.Count > 0);
 
-            ImGui.BeginDisabled(Plugin.BulkRemover.IsActive);
-            ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.RedDanger);
-            if (ImGui.Button(removeBtnLabel, new Vector2(btnW, 0)))
+            ImGui.SameLine(0, 12f * scale);
+
+            // Bulk In-Game Group Assignment
+            ImGui.BeginDisabled(selectedIds.Count == 0 || isBusy);
+
+            ImGui.SetNextItemWidth(155f * scale);
+            var targetLabel = Plugin.Config.GetNativeGroupLabel(bulkTargetGroup);
+            ImGui.PushStyleColor(ImGuiCol.Text, Plugin.Config.GetNativeGroupColor(bulkTargetGroup));
+            var openedGroupCombo = ImGui.BeginCombo("##BulkGroupPick", targetLabel);
+            ImGui.PopStyleColor();
+            if (openedGroupCombo)
             {
-                pendingBatchTargets = allFriends.Where(f => selectedIds.Contains(f.ContentId)).ToList();
-                openConfirmModal = true;
+                foreach (var g in NativeFriendGroups.All)
+                {
+                    ImGui.PushStyleColor(ImGuiCol.Text, Plugin.Config.GetNativeGroupColor(g.Id));
+                    if (ImGui.Selectable($"{Plugin.Config.GetNativeGroupLabel(g.Id)}##bg_{g.Id}", bulkTargetGroup == g.Id))
+                        bulkTargetGroup = g.Id;
+                    ImGui.PopStyleColor();
+                }
+                ImGui.EndCombo();
+            }
+
+            ImGui.SameLine();
+            if (ImGui.Button(L.T("Set Game Group", "Definir Grupo")))
+            {
+                var targets = allFriends.Where(f => selectedIds.Contains(f.ContentId)).ToList();
+                if (targets.Count > 0)
+                {
+                    pendingBatchKind = BulkActionKind.SetNativeGroup;
+                    pendingBatchGroup = bulkTargetGroup;
+                    pendingBatchTargets = targets;
+                    openConfirmModal = true;
+                }
+            }
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip(L.T("Assigns or moves selected friends into this native FFXIV Friend Group.", "Adiciona ou move os amigos selecionados para este Grupo nativo no FFXIV."));
+
+            ImGui.SameLine();
+            ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgPanel);
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.BgElevated);
+            if (ImGui.Button(L.T("Clear Group", "Tirar do Grupo")))
+            {
+                var targets = allFriends.Where(f => selectedIds.Contains(f.ContentId) && f.NativeGroup > 0).ToList();
+                if (targets.Count > 0)
+                {
+                    pendingBatchKind = BulkActionKind.ClearNativeGroup;
+                    pendingBatchGroup = 0;
+                    pendingBatchTargets = targets;
+                    openConfirmModal = true;
+                }
             }
             ImGui.PopStyleColor(2);
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip(L.T("Removes selected friends from their native FFXIV Friend Group.", "Remove os amigos selecionados do Grupo nativo no FFXIV."));
+
+            ImGui.SameLine(0, 10f * scale);
+            ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
+            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.RedDanger);
+            if (ImGui.Button(L.T($"Remove ({selectedIds.Count})", $"Remover ({selectedIds.Count})")))
+            {
+                var targets = allFriends.Where(f =>
+                {
+                    if (!selectedIds.Contains(f.ContentId)) return false;
+                    var m = Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name);
+                    return !m.IsProtected;
+                }).ToList();
+
+                if (targets.Count > 0)
+                {
+                    pendingBatchKind = BulkActionKind.RemoveFriend;
+                    pendingBatchGroup = 0;
+                    pendingBatchTargets = targets;
+                    openConfirmModal = true;
+                }
+            }
+            ImGui.PopStyleColor(2);
+            if (ImGui.IsItemHovered(ImGuiHoveredFlags.AllowWhenDisabled))
+                ImGui.SetTooltip(L.T("Safely removes selected non-protected friends from your FFXIV Friend List.", "Remove com segurança os amigos selecionados (não protegidos) da Lista de Amigos."));
+
             ImGui.EndDisabled();
         }
 
-        ImGui.Spacing();
+        // ── Friends Table ──
+        if (allFriends.Count == 0)
+        {
+            using (UiCard.Begin())
+            {
+                UiControls.InsetNote(L.T(
+                    "Friend List has not loaded yet. Click 'Refresh' or open your in-game Friend List (O) once.",
+                    "A Lista de Amigos ainda não carregou. Clique em 'Atualizar' ou abra a Lista de Amigos do jogo (O) uma vez."), Theme.YellowMain);
+            }
+            return;
+        }
 
-        // Friends Table
-        var flags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
-        if (ImGui.BeginTable("##FriendsMainTable", 8, flags, new Vector2(0, ImGui.GetContentRegionAvail().Y)))
+        var showLastSeen = Plugin.Config.ShowLastSeen;
+        var colCount = showLastSeen ? 7 : 6;
+        var tableFlags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.BordersOuter
+            | ImGuiTableFlags.ScrollY | ImGuiTableFlags.Resizable | ImGuiTableFlags.SizingStretchProp;
+
+        var tableAvailH = MathF.Max(180f * scale, ImGui.GetContentRegionAvail().Y - 24f * scale);
+        if (ImGui.BeginTable("##FlfFriendsTable", colCount, tableFlags, new Vector2(0, tableAvailH)))
         {
             ImGui.TableSetupScrollFreeze(0, 1);
-            ImGui.TableSetupColumn("##Sel", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoResize, 28f);
-            ImGui.TableSetupColumn(L.T("Status", "Status"), ImGuiTableColumnFlags.WidthFixed, 68f);
-            ImGui.TableSetupColumn(L.T("Friend", "Amigo"), ImGuiTableColumnFlags.WidthStretch, 1.85f);
-            ImGui.TableSetupColumn(L.T("World", "Servidor"), ImGuiTableColumnFlags.WidthStretch, 1.05f);
-            ImGui.TableSetupColumn(L.T("Job / Location", "Classe / Local"), ImGuiTableColumnFlags.WidthStretch, 1.45f);
-            ImGui.TableSetupColumn(L.T("Group", "Grupo"), ImGuiTableColumnFlags.WidthStretch, 0.9f);
-            ImGui.TableSetupColumn(L.T("Last Seen", "Visto"), ImGuiTableColumnFlags.WidthStretch, 0.85f);
-            ImGui.TableSetupColumn(L.T("Actions", "Ações"), ImGuiTableColumnFlags.WidthFixed, 86f);
+            ImGui.TableSetupColumn("##Sel", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoResize, 28f * scale);
+            ImGui.TableSetupColumn("★##Prot", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoResize, 28f * scale);
+            ImGui.TableSetupColumn(L.T("Friend", "Amigo"), ImGuiTableColumnFlags.WidthStretch, 2.2f);
+            ImGui.TableSetupColumn(L.T("Game Group", "Grupo no Jogo"), ImGuiTableColumnFlags.WidthStretch, 1.15f);
+            ImGui.TableSetupColumn(L.T("World / Status", "Mundo / Status"), ImGuiTableColumnFlags.WidthStretch, 1.35f);
+            if (showLastSeen)
+                ImGui.TableSetupColumn(L.T("Last Seen", "Visto"), ImGuiTableColumnFlags.WidthFixed, 92f * scale);
+            ImGui.TableSetupColumn("##Actions", ImGuiTableColumnFlags.WidthFixed | ImGuiTableColumnFlags.NoResize, 58f * scale);
             ImGui.TableHeadersRow();
 
             foreach (var f in filtered)
             {
                 var meta = Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name);
-                var grp = Plugin.Config.FindGroup(meta.GroupId);
-
+                ImGui.PushID((int)(f.ContentId ^ (f.ContentId >> 32)));
                 ImGui.TableNextRow();
-                ImGui.PushID((int)(f.ContentId & 0x7FFFFFFF) ^ f.RawIndex);
 
-                // 1. Select checkbox (or Protected lock)
+                // Col 0: Selection Checkbox
                 ImGui.TableNextColumn();
-                if (meta.IsProtected)
+                var isSelected = selectedIds.Contains(f.ContentId);
+                if (ImGui.Checkbox("##chk", ref isSelected))
                 {
-                    ImGui.TextColored(Theme.YellowMain, " ★");
-                    if (ImGui.IsItemHovered())
-                        ImGui.SetTooltip(L.T("Protected favorite — cannot be bulk-removed.", "Favorito protegido — não pode ser removido em massa."));
-                }
-                else
-                {
-                    var isSel = selectedIds.Contains(f.ContentId);
-                    if (ImGui.Checkbox("##chk", ref isSel))
-                    {
-                        if (isSel) selectedIds.Add(f.ContentId);
-                        else selectedIds.Remove(f.ContentId);
-                    }
+                    if (isSelected) selectedIds.Add(f.ContentId);
+                    else selectedIds.Remove(f.ContentId);
                 }
 
-                // 2. Online status
+                // Col 1: Protected Favorite Toggle (★)
                 ImGui.TableNextColumn();
-                var (dotCol, stateLabel) = f.OnlineState switch
-                {
-                    FriendOnlineState.Online => (Theme.GreenOnline, L.T("Online", "Online")),
-                    FriendOnlineState.InDuty => (Theme.CyanDuty, L.T("Duty", "Duty")),
-                    FriendOnlineState.Away => (Theme.OrangeAway, L.T("AFK", "AFK")),
-                    FriendOnlineState.Busy => (Theme.RedDanger, L.T("Busy", "Ocup.")),
-                    _ => (Theme.TextMuted, L.T("Offline", "Offline")),
-                };
-                ImGui.TextColored(dotCol, $"● {stateLabel}");
-
-                // 3. Name + Nickname + FC + Note indicator
-                ImGui.TableNextColumn();
-                var nameCol = meta.UseCustomColor
-                    ? meta.CustomColor
-                    : grp != null ? grp.Color : (f.IsOnline ? Theme.TextWhite : Theme.TextLight);
-
-                var displayName = string.IsNullOrWhiteSpace(meta.Nickname)
-                    ? f.Name
-                    : $"{f.Name} ({meta.Nickname})";
-                ImGui.TextColored(nameCol, displayName);
-                if (!string.IsNullOrEmpty(f.FcTag))
-                {
-                    ImGui.SameLine();
-                    ImGui.TextColored(Theme.TextMuted, $"«{f.FcTag}»");
-                }
-                if (!string.IsNullOrWhiteSpace(meta.Note) && ImGui.IsItemHovered())
-                {
-                    ImGui.SetTooltip($"{L.T("Note", "Nota")}: {meta.Note}");
-                }
-
-                // 4. World
-                ImGui.TableNextColumn();
-                ImGui.TextColored(f.IsOnline ? Theme.TextLight : Theme.TextMuted, f.WorldDisplay);
-
-                // 5. Job / Location
-                ImGui.TableNextColumn();
-                if (f.IsOnline)
-                {
-                    var loc = string.IsNullOrEmpty(f.JobAbbrev)
-                        ? f.LocationName
-                        : string.IsNullOrEmpty(f.LocationName) ? f.JobAbbrev : $"[{f.JobAbbrev}] {f.LocationName}";
-                    ImGui.TextColored(Theme.TextLight, loc);
-                }
-                else
-                {
-                    ImGui.TextColored(Theme.TextMuted, "-");
-                }
-
-                // 6. Group
-                ImGui.TableNextColumn();
-                if (grp != null)
-                {
-                    ImGui.TextColored(grp.Color, grp.Name);
-                }
-                else
-                {
-                    ImGui.TextColored(Theme.TextMuted, "-");
-                }
-
-                // 7. Last Seen
-                ImGui.TableNextColumn();
-                ImGui.TextColored(f.IsOnline ? Theme.GreenOnline : Theme.TextMuted,
-                    L.FormatRelativeTime(meta.LastSeenOnlineUtc, f.IsOnline));
-
-                // 8. Quick Actions (Protect star + Edit)
-                ImGui.TableNextColumn();
+                ImGui.PushStyleColor(ImGuiCol.Button, Vector4.Zero);
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.PurpleSoft);
                 ImGui.PushStyleColor(ImGuiCol.Text, meta.IsProtected ? Theme.YellowMain : Theme.TextMuted);
-                if (ImGui.SmallButton(meta.IsProtected ? "★" : "☆"))
+                if (ImGui.SmallButton(meta.IsProtected ? "★##fav" : "☆##fav"))
                 {
                     meta.IsProtected = !meta.IsProtected;
-                    if (meta.IsProtected) selectedIds.Remove(f.ContentId);
                     Plugin.Config.Save();
                 }
-                ImGui.PopStyleColor();
+                ImGui.PopStyleColor(3);
                 if (ImGui.IsItemHovered())
-                    ImGui.SetTooltip(L.T("Toggle Protected Favorite", "Alternar Favorito Protegido"));
+                    ImGui.SetTooltip(meta.IsProtected
+                        ? L.T("Protected favorite (blocked from bulk removal). Click to unprotect.", "Favorito protegido (bloqueado contra remoção em massa). Clique para desproteger.")
+                        : L.T("Click to protect from bulk removal.", "Clique para proteger contra remoção em massa."));
 
-                ImGui.SameLine();
-                if (ImGui.SmallButton(L.T("Edit", "Editar")))
+                // Col 2: Status Dot + Name + Nickname + FC Tag + ContextMenu
+                ImGui.TableNextColumn();
+                var dotColor = !f.IsOnline ? Theme.TextMuted
+                    : f.IsInDuty ? Theme.CyanDuty
+                    : f.IsAway ? Theme.OrangeAway
+                    : Theme.GreenOnline;
+
+                ImGui.TextColored(dotColor, f.IsOnline ? "●" : "○");
+                ImGui.SameLine(0, 6f * scale);
+
+                var nameColor = meta.UseCustomColor ? meta.CustomColor
+                    : f.IsOnline ? Theme.TextWhite : Theme.TextLight;
+
+                ImGui.TextColored(nameColor, f.Name);
+
+                if (Plugin.Config.ShowFcTag && !string.IsNullOrEmpty(f.FcTag))
                 {
-                    editingContentId = f.ContentId;
-                    editFriendName = f.Name;
-                    editNickname = meta.Nickname;
-                    editNote = meta.Note;
-                    editGroupId = meta.GroupId;
-                    editProtected = meta.IsProtected;
-                    editUseColor = meta.UseCustomColor;
-                    editColor = meta.CustomColor;
-                    openEditModal = true;
+                    ImGui.SameLine(0, 5f * scale);
+                    ImGui.TextColored(Theme.TextMuted, $"«{f.FcTag}»");
                 }
+
+                if (Plugin.Config.ShowNickname && !string.IsNullOrEmpty(meta.Nickname))
+                {
+                    ImGui.SameLine(0, 6f * scale);
+                    ImGui.TextColored(Theme.YellowMain, $"({meta.Nickname})");
+                }
+
+                if (!string.IsNullOrEmpty(meta.Note))
+                {
+                    ImGui.SameLine(0, 6f * scale);
+                    ImGui.TextColored(Theme.PurpleBright, "[i]");
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(meta.Note);
+                }
+
+                // Right-click row context menu for 1-click native group sync!
+                if (ImGui.BeginPopupContextItem("##RowCtx"))
+                {
+                    ImGui.TextColored(Theme.YellowMain, f.Name);
+                    ImGui.Separator();
+
+                    ImGui.BeginDisabled(Plugin.BulkRemover.IsRunning);
+                    if (ImGui.BeginMenu(L.T("Set In-Game Group", "Definir Grupo no Jogo")))
+                    {
+                        foreach (var g in NativeFriendGroups.All)
+                        {
+                            ImGui.PushStyleColor(ImGuiCol.Text, Plugin.Config.GetNativeGroupColor(g.Id));
+                            var isCurrent = f.NativeGroup == g.Id;
+                            if (ImGui.MenuItem(Plugin.Config.GetNativeGroupLabel(g.Id), string.Empty, isCurrent))
+                            {
+                                if (!isCurrent)
+                                    Plugin.BulkRemover.StartSetGroupBatch([f], g.Id);
+                            }
+                            ImGui.PopStyleColor();
+                        }
+                        ImGui.EndMenu();
+                    }
+
+                    if (f.NativeGroup > 0)
+                    {
+                        if (ImGui.MenuItem(L.T("Remove from In-Game Group", "Remover do Grupo no Jogo")))
+                            Plugin.BulkRemover.StartClearGroupBatch([f]);
+                    }
+                    ImGui.EndDisabled();
+
+                    ImGui.Separator();
+                    if (ImGui.MenuItem(L.T("Edit Note / Nickname", "Editar Nota / Apelido")))
+                        OpenEditModalFor(f, meta);
+
+                    if (ImGui.MenuItem(meta.IsProtected ? L.T("Unprotect Favorite", "Desproteger Favorito") : L.T("Protect Favorite ★", "Proteger Favorito ★")))
+                    {
+                        meta.IsProtected = !meta.IsProtected;
+                        Plugin.Config.Save();
+                    }
+
+                    if (!meta.IsProtected && !Plugin.BulkRemover.IsRunning)
+                    {
+                        ImGui.Separator();
+                        ImGui.PushStyleColor(ImGuiCol.Text, Theme.RedDanger);
+                        if (ImGui.MenuItem(L.T("Remove from Friend List", "Remover da Lista de Amigos")))
+                        {
+                            pendingBatchKind = BulkActionKind.RemoveFriend;
+                            pendingBatchGroup = 0;
+                            pendingBatchTargets = [f];
+                            openConfirmModal = true;
+                        }
+                        ImGui.PopStyleColor();
+                    }
+
+                    ImGui.EndPopup();
+                }
+
+                // Col 3: Native In-Game Group Badge
+                ImGui.TableNextColumn();
+                if (f.NativeGroup > 0)
+                {
+                    UiControls.DrawPillBadge(
+                        Plugin.Config.GetNativeGroupLabel(f.NativeGroup),
+                        Plugin.Config.GetNativeGroupColor(f.NativeGroup));
+                }
+                else
+                {
+                    ImGui.TextColored(Theme.TextMuted, "—");
+                }
+
+                // Col 4: World / Job / Location
+                ImGui.TableNextColumn();
+                var worldText = f.CurrentWorldId != 0 && f.CurrentWorldId != f.HomeWorldId && !string.IsNullOrEmpty(f.CurrentWorldName)
+                    ? $"{f.HomeWorldName} -> {f.CurrentWorldName}"
+                    : f.HomeWorldName;
+
+                if (f.IsOnline)
+                {
+                    var detail = !string.IsNullOrEmpty(f.JobAbbr) ? $"[{f.JobAbbr}] {worldText}" : worldText;
+                    ImGui.TextColored(Theme.TextLight, detail);
+                    if (!string.IsNullOrEmpty(f.LocationName) && ImGui.IsItemHovered())
+                        ImGui.SetTooltip(f.LocationName);
+                }
+                else
+                {
+                    ImGui.TextColored(Theme.TextMuted, worldText);
+                }
+
+                // Col 5: Last Seen
+                if (showLastSeen)
+                {
+                    ImGui.TableNextColumn();
+                    ImGui.TextColored(f.IsOnline ? Theme.GreenOnline : Theme.TextMuted,
+                        L.FormatRelativeTime(meta.LastSeenOnlineUtc, f.IsOnline));
+                }
+
+                // Col 6: Edit Button
+                ImGui.TableNextColumn();
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.PurpleMain);
+                if (ImGui.SmallButton(L.T("Edit##btn", "Edit##btn")))
+                    OpenEditModalFor(f, meta);
+                ImGui.PopStyleColor(2);
 
                 ImGui.PopID();
             }
 
             ImGui.EndTable();
         }
-    }
 
-    private void DrawBulkRemoveTab()
-    {
-        var br = Plugin.BulkRemover;
-
-        ImGui.TextColored(Theme.YellowMain, L.T("Bulk Friend Removal Engine", "Motor de Remoção em Massa"));
-        ImGui.TextWrapped(L.T(
-            "Select multiple friends in the 'Friends' tab using the checkboxes, then click 'Remove Selected'. " +
-            "FriendList Frenzy will automatically open the native Friend List, trigger 'Remove from Friend List', verify the confirmation prompt matches the exact friend name, and confirm one-by-one at a safe server-friendly pace.",
-            "Selecione vários amigos na aba 'Amigos' usando as caixas de seleção e clique em 'Remover Selecionados'. " +
-            "O FriendList Frenzy abrirá a Lista de Amigos nativa, acionará 'Remover da Lista de Amigos', verificará se o diálogo de confirmação corresponde ao nome exato do alvo e confirmará um por um em um ritmo seguro."));
-
-        ImGui.Spacing();
-        var delaySec = Plugin.Config.RemovalDelayMs / 1000f;
-        ImGui.SetNextItemWidth(240f);
-        if (ImGui.SliderFloat(L.T("Delay between removals (seconds)", "Intervalo entre remoções (segundos)"), ref delaySec, 0.8f, 4.0f, "%.1fs"))
-        {
-            Plugin.Config.RemovalDelayMs = (int)(delaySec * 1000);
-            Plugin.Config.Save();
-        }
-
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.TextColored(Theme.YellowMain, L.T("Removal Activity Log", "Histórico de Remoções"));
-
-        var flags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp;
-        if (ImGui.BeginTable("##BulkLogTable", 4, flags, new Vector2(0, ImGui.GetContentRegionAvail().Y)))
-        {
-            ImGui.TableSetupScrollFreeze(0, 1);
-            ImGui.TableSetupColumn(L.T("Time", "Hora"), ImGuiTableColumnFlags.WidthFixed, 76f);
-            ImGui.TableSetupColumn(L.T("Friend", "Amigo"), ImGuiTableColumnFlags.WidthStretch, 1.4f);
-            ImGui.TableSetupColumn(L.T("Result", "Resultado"), ImGuiTableColumnFlags.WidthFixed, 84f);
-            ImGui.TableSetupColumn(L.T("Details", "Detalhes"), ImGuiTableColumnFlags.WidthStretch, 2.0f);
-            ImGui.TableHeadersRow();
-
-            foreach (var item in br.RecentLog)
-            {
-                ImGui.TableNextRow();
-                ImGui.TableNextColumn(); ImGui.TextColored(Theme.TextMuted, item.TimeLocal.ToString("HH:mm:ss"));
-                ImGui.TableNextColumn(); ImGui.TextUnformatted(item.Name);
-                ImGui.TableNextColumn();
-                ImGui.TextColored(item.Success ? Theme.GreenOnline : Theme.RedDanger,
-                    item.Success ? L.T("Removed", "Removido") : L.T("Skipped", "Ignorado"));
-                ImGui.TableNextColumn(); ImGui.TextColored(Theme.TextMuted, item.Message);
-            }
-            ImGui.EndTable();
-        }
+        ImGui.TextColored(Theme.TextMuted, L.T(
+            $"Showing {filtered.Count} of {allFriends.Count} friends  •  Right-click any friend for quick in-game group actions",
+            $"Mostrando {filtered.Count} de {allFriends.Count} amigos  •  Clique com o botão direito em qualquer amigo para ações rápidas de grupo"));
     }
 
     private void DrawGroupsTab()
     {
-        ImGui.TextColored(Theme.YellowMain, L.T("Create Custom Group", "Criar Grupo Personalizado"));
-        ImGui.SetNextItemWidth(260f);
-        ImGui.InputTextWithHint("##NewGroupName", L.T("Group name (e.g. Static, RP, Inactive)...", "Nome do grupo (ex: Static, RP, Inativos)..."), ref newGroupName, 40);
-        ImGui.SameLine();
-        ImGui.ColorEdit4("##NewGroupColor", ref newGroupColor, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.NoAlpha);
-        ImGui.SameLine();
-        if (ImGui.Button(L.T("Add Group", "Adicionar Grupo")))
+        var scale = ImGuiHelpers.GlobalScale;
+        var allFriends = Plugin.Friends.Friends.ToList();
+        var isBusy = Plugin.BulkRemover.IsRunning;
+
+        if (!ImGui.BeginChild("##GroupsScroll", Vector2.Zero, false))
+            return;
+
+        using (UiCard.Begin(L.T("FFXIV Native Friend Groups", "Grupos Nativos da Lista de Amigos (FFXIV)")))
         {
-            var trimmed = newGroupName.Trim();
-            if (!string.IsNullOrEmpty(trimmed))
+            UiControls.InsetNote(L.T(
+                "These are FFXIV's 7 real in-game Friend Groups. Give each symbol a custom label & color here, filter by group, or move/clear all members of a group directly in the game's Friend List.",
+                "Estes são os 7 Grupos reais do FFXIV. Dê um nome e cor personalizados para cada símbolo, filtre por grupo ou mova/limpe todos os membros de um grupo direto na Lista de Amigos do jogo."));
+        }
+
+        foreach (var g in NativeFriendGroups.All)
+        {
+            var custom = Plugin.Config.GetOrCreateNativeGroup(g.Id);
+            var members = allFriends.Where(f => f.NativeGroup == g.Id).ToList();
+            var onlineMembers = members.Count(f => f.IsOnline);
+            var col = Plugin.Config.GetNativeGroupColor(g.Id);
+
+            ImGui.PushID($"ng_{g.Id}");
+            using (UiCard.Begin("", Theme.BgPanel, new Vector4(col.X, col.Y, col.Z, 0.42f)))
             {
-                Plugin.Config.Groups.Add(new FriendGroup
+                // Top row: Symbol + Custom Name Input + Color Picker + Member Count + View Button
+                UiControls.DrawPillBadge($"{g.Symbol}  #{g.Id}", col, true);
+                ImGui.SameLine(0, 8f * scale);
+
+                var labelBuf = custom.CustomName;
+                ImGui.SetNextItemWidth(190f * scale);
+                if (ImGui.InputTextWithHint("##gName", L.T(g.DefaultNameEn, g.DefaultNamePt), ref labelBuf, 32))
                 {
-                    Id = Guid.NewGuid().ToString("N")[..8],
-                    Name = trimmed,
-                    Color = newGroupColor,
-                });
-                Plugin.Config.Save();
-                newGroupName = string.Empty;
+                    custom.CustomName = labelBuf;
+                    Plugin.Config.Save();
+                }
+
+                ImGui.SameLine();
+                var colEdit = col;
+                if (ImGui.ColorEdit4("##gCol", ref colEdit, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.NoAlpha))
+                {
+                    custom.Color = colEdit;
+                    custom.UseCustomColor = true;
+                    Plugin.Config.Save();
+                }
+                if (ImGui.IsItemHovered())
+                    ImGui.SetTooltip(L.T("Badge color in FriendList Frenzy", "Cor do badge no FriendList Frenzy"));
+
+                if (custom.UseCustomColor)
+                {
+                    ImGui.SameLine(0, 4f * scale);
+                    ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
+                    if (ImGui.SmallButton("×##rstCol"))
+                    {
+                        custom.UseCustomColor = false;
+                        custom.Color = g.DefaultColor;
+                        Plugin.Config.Save();
+                    }
+                    ImGui.PopStyleColor();
+                    if (ImGui.IsItemHovered())
+                        ImGui.SetTooltip(L.T("Reset to default color", "Restaurar cor padrão"));
+                }
+
+                ImGui.SameLine(0, 12f * scale);
+                ImGui.TextColored(members.Count > 0 ? Theme.TextWhite : Theme.TextMuted,
+                    L.T($"{members.Count} friends ({onlineMembers} online)", $"{members.Count} amigos ({onlineMembers} online)"));
+
+                // Action row: View in Friends | Move All To [Group] | Clear Group
+                ImGui.Dummy(new Vector2(0, 2f * scale));
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
+                if (ImGui.Button(L.T("View Members", "Ver Membros")))
+                {
+                    nativeGroupFilter = g.Id;
+                    requestFocusFriendsTab = true;
+                }
+                ImGui.PopStyleColor();
+
+                ImGui.SameLine(0, 10f * scale);
+                ImGui.BeginDisabled(members.Count == 0 || isBusy);
+
+                // Ensure default move target isn't self
+                if (moveAllTargets[g.Id] == g.Id || moveAllTargets[g.Id] < 1 || moveAllTargets[g.Id] > NativeFriendGroups.MaxGroupId)
+                    moveAllTargets[g.Id] = g.Id == 1 ? (byte)2 : (byte)1;
+
+                ImGui.SetNextItemWidth(145f * scale);
+                var destId = moveAllTargets[g.Id];
+                ImGui.PushStyleColor(ImGuiCol.Text, Plugin.Config.GetNativeGroupColor(destId));
+                var openDest = ImGui.BeginCombo("##moveDest", Plugin.Config.GetNativeGroupLabel(destId));
+                ImGui.PopStyleColor();
+                if (openDest)
+                {
+                    foreach (var dest in NativeFriendGroups.All)
+                    {
+                        if (dest.Id == g.Id) continue;
+                        ImGui.PushStyleColor(ImGuiCol.Text, Plugin.Config.GetNativeGroupColor(dest.Id));
+                        if (ImGui.Selectable(Plugin.Config.GetNativeGroupLabel(dest.Id), destId == dest.Id))
+                            moveAllTargets[g.Id] = dest.Id;
+                        ImGui.PopStyleColor();
+                    }
+                    ImGui.EndCombo();
+                }
+
+                ImGui.SameLine();
+                if (ImGui.Button(L.T("Move All Here", "Mover Todos")))
+                {
+                    pendingBatchKind = BulkActionKind.SetNativeGroup;
+                    pendingBatchGroup = moveAllTargets[g.Id];
+                    pendingBatchTargets = members;
+                    openConfirmModal = true;
+                }
+
+                ImGui.SameLine(0, 10f * scale);
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.RedDanger);
+                if (ImGui.Button(L.T("Empty Group", "Esvaziar Grupo")))
+                {
+                    pendingBatchKind = BulkActionKind.ClearNativeGroup;
+                    pendingBatchGroup = 0;
+                    pendingBatchTargets = members;
+                    openConfirmModal = true;
+                }
+                ImGui.PopStyleColor(2);
+
+                ImGui.EndDisabled();
+            }
+            ImGui.PopID();
+        }
+
+        // Ungrouped summary card
+        var ungroupedCount = allFriends.Count(f => f.NativeGroup == 0);
+        using (UiCard.Begin("", Theme.BgPanel, Theme.BorderSoft))
+        {
+            UiControls.DrawPillBadge(L.T("○ Ungrouped", "○ Sem Grupo"), Theme.TextMuted);
+            ImGui.SameLine(0, 10f * scale);
+            ImGui.TextColored(Theme.TextLight, L.T($"{ungroupedCount} friends without an in-game group", $"{ungroupedCount} amigos sem grupo no jogo"));
+            ImGui.SameLine(0, 12f * scale);
+            ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
+            if (ImGui.Button(L.T("Filter Ungrouped", "Filtrar Sem Grupo")))
+            {
+                nativeGroupFilter = 0;
+                requestFocusFriendsTab = true;
+            }
+            ImGui.PopStyleColor();
+        }
+
+        ImGui.EndChild();
+    }
+
+    private void DrawBulkQueueTab()
+    {
+        var scale = ImGuiHelpers.GlobalScale;
+        var bulk = Plugin.BulkRemover;
+
+        using (UiCard.Begin(L.T("Live Queue Status", "Status da Fila")))
+        {
+            if (bulk.IsRunning)
+            {
+                var processed = bulk.SucceededCount + bulk.FailedCount;
+                var total = Math.Max(1, bulk.TotalInBatch);
+                var progress = Math.Clamp((float)processed / total, 0f, 1f);
+
+                ImGui.TextColored(Theme.YellowMain, bulk.GetBatchActionLabel(bulk.CurrentBatchKind, bulk.CurrentBatchTargetGroup));
+                ImGui.TextColored(Theme.TextLight, $"{L.T("Status:", "Status:")} {bulk.StatusMessage}");
+                ImGui.TextColored(Theme.TextMuted, $"{L.T("Current target:", "Alvo atual:")} {bulk.CurrentTargetName}");
+                ImGui.ProgressBar(progress, new Vector2(UiCard.InnerWidth, 20f * scale),
+                    $"{processed}/{bulk.TotalInBatch}  (OK: {bulk.SucceededCount}, {L.T("Failed", "Falhas")}: {bulk.FailedCount})");
+
+                ImGui.Spacing();
+                if (ImGui.Button(bulk.IsPaused ? L.T("Resume", "Retomar") : L.T("Pause", "Pausar"), new Vector2(120f * scale, 0)))
+                    bulk.TogglePause();
+                ImGui.SameLine();
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.RedDanger);
+                if (ImGui.Button(L.T("Cancel Queue", "Cancelar Fila"), new Vector2(130f * scale, 0)))
+                    bulk.Cancel();
+                ImGui.PopStyleColor(2);
+            }
+            else
+            {
+                ImGui.TextColored(Theme.TextLight, string.IsNullOrEmpty(bulk.StatusMessage)
+                    ? L.T("Queue is idle. Select friends in the Friends tab to bulk-assign native groups, clear groups, or remove friends.",
+                          "Fila ociosa. Selecione amigos na aba Amigos para atribuir grupos nativos, limpar grupos ou remover amigos em massa.")
+                    : bulk.StatusMessage);
             }
         }
 
-        ImGui.Spacing();
-        ImGui.Separator();
+        ImGui.TextColored(Theme.YellowMain, L.T("ACTIVITY LOG", "LOG DE ATIVIDADES"));
+        ImGui.SameLine();
+        ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
+        if (ImGui.SmallButton(L.T("Clear Log", "Limpar Log")))
+            bulk.ClearLog();
+        ImGui.PopStyleColor();
 
-        var allFriends = Plugin.Friends.GetSnapshot();
-        var flags = ImGuiTableFlags.Borders | ImGuiTableFlags.RowBg | ImGuiTableFlags.ScrollY | ImGuiTableFlags.SizingStretchProp;
-        if (ImGui.BeginTable("##GroupsTable", 4, flags, new Vector2(0, ImGui.GetContentRegionAvail().Y)))
+        var logFlags = ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerH | ImGuiTableFlags.BordersOuter | ImGuiTableFlags.ScrollY;
+        if (ImGui.BeginTable("##BulkLogTable", 4, logFlags, new Vector2(0, ImGui.GetContentRegionAvail().Y)))
         {
             ImGui.TableSetupScrollFreeze(0, 1);
-            ImGui.TableSetupColumn(L.T("Color", "Cor"), ImGuiTableColumnFlags.WidthFixed, 54f);
-            ImGui.TableSetupColumn(L.T("Group Name", "Nome do Grupo"), ImGuiTableColumnFlags.WidthStretch, 2.0f);
-            ImGui.TableSetupColumn(L.T("Members", "Membros"), ImGuiTableColumnFlags.WidthFixed, 90f);
-            ImGui.TableSetupColumn(L.T("Actions", "Ações"), ImGuiTableColumnFlags.WidthFixed, 100f);
+            ImGui.TableSetupColumn(L.T("Time", "Hora"), ImGuiTableColumnFlags.WidthFixed, 76f * scale);
+            ImGui.TableSetupColumn(L.T("Action", "Ação"), ImGuiTableColumnFlags.WidthFixed, 92f * scale);
+            ImGui.TableSetupColumn(L.T("Friend", "Amigo"), ImGuiTableColumnFlags.WidthStretch, 1.3f);
+            ImGui.TableSetupColumn(L.T("Result", "Resultado"), ImGuiTableColumnFlags.WidthStretch, 2.0f);
             ImGui.TableHeadersRow();
 
-            string? toDeleteId = null;
-            for (var i = 0; i < Plugin.Config.Groups.Count; i++)
+            foreach (var entry in bulk.ActionLog)
             {
-                var grp = Plugin.Config.Groups[i];
-                var memberCount = allFriends.Count(f =>
-                    Plugin.Config.FriendMetadata.TryGetValue(f.ContentId, out var m) && m.GroupId == grp.Id);
-
                 ImGui.TableNextRow();
-                ImGui.PushID(grp.Id);
+                ImGui.TableNextColumn();
+                ImGui.TextColored(Theme.TextMuted, entry.TimestampUtc.ToLocalTime().ToString("HH:mm:ss"));
 
                 ImGui.TableNextColumn();
-                var col = grp.Color;
-                if (ImGui.ColorEdit4("##gcol", ref col, ImGuiColorEditFlags.NoInputs | ImGuiColorEditFlags.NoAlpha))
+                var (tag, tagCol) = entry.Action switch
                 {
-                    grp.Color = col;
-                    Plugin.Config.Save();
-                }
+                    BulkActionKind.SetNativeGroup => (L.T("GROUP", "GRUPO"), Theme.CyanDuty),
+                    BulkActionKind.ClearNativeGroup => (L.T("UNGROUP", "LIMPAR"), Theme.OrangeAway),
+                    BulkActionKind.RemoveFriend => (L.T("REMOVE", "REMOVER"), Theme.RedDanger),
+                    _ => ("INFO", Theme.TextMuted),
+                };
+                ImGui.TextColored(tagCol, tag);
 
                 ImGui.TableNextColumn();
-                var gname = grp.Name;
-                ImGui.SetNextItemWidth(-1);
-                if (ImGui.InputText("##gname", ref gname, 40))
-                {
-                    grp.Name = gname;
-                    Plugin.Config.Save();
-                }
+                ImGui.TextColored(Theme.TextWhite, entry.FriendName);
 
                 ImGui.TableNextColumn();
-                ImGui.TextUnformatted(memberCount.ToString());
-
-                ImGui.TableNextColumn();
-                ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
-                if (ImGui.SmallButton(L.T("Delete", "Excluir")))
-                    toDeleteId = grp.Id;
-                ImGui.PopStyleColor();
-
-                ImGui.PopID();
-            }
-
-            if (toDeleteId != null)
-            {
-                Plugin.Config.Groups.RemoveAll(g => g.Id == toDeleteId);
-                foreach (var meta in Plugin.Config.FriendMetadata.Values)
-                {
-                    if (meta.GroupId == toDeleteId) meta.GroupId = string.Empty;
-                }
-                if (groupFilterId == toDeleteId) groupFilterId = "__all__";
-                Plugin.Config.Save();
+                ImGui.TextColored(entry.Success ? Theme.GreenOnline : Theme.RedDanger, entry.Message);
             }
 
             ImGui.EndTable();
@@ -615,91 +888,151 @@ public sealed class MainWindow : Window
 
     private void DrawSettingsTab()
     {
-        ImGui.TextColored(Theme.YellowMain, L.T("General Settings", "Configurações Gerais"));
-        ImGui.Separator();
+        if (!ImGui.BeginChild("##SettingsScroll", Vector2.Zero, false))
+            return;
 
-        var isPt = L.IsPt;
-        ImGui.TextUnformatted(L.T("Interface Language:", "Idioma da Interface:"));
-        ImGui.SameLine();
-        if (ImGui.RadioButton("English (Default)", !isPt))
+        using (UiCard.Begin(L.T("Bulk Automation (In-Game Sync)", "Automação em Massa (Sincronização no Jogo)")))
         {
-            Plugin.Config.Language = "en";
-            Plugin.Config.Save();
-        }
-        ImGui.SameLine();
-        if (ImGui.RadioButton("Português (BR)", isPt))
-        {
-            Plugin.Config.Language = "pt";
-            Plugin.Config.Save();
-        }
+            var delay = Plugin.Config.RemovalDelayMs;
+            if (UiControls.SettingSliderIntRow("delay",
+                L.T("Delay between actions", "Intervalo entre ações"),
+                ref delay, 500, 3500, "%d ms",
+                L.T("Safer values (900-1500ms) give FFXIV time to sync each change with the server.",
+                    "Valores seguros (900-1500ms) dão tempo ao FFXIV para sincronizar cada alteração com o servidor.")))
+            {
+                Plugin.Config.RemovalDelayMs = delay;
+                Plugin.Config.Save();
+            }
 
-        ImGui.Spacing();
-        var closeAfter = Plugin.Config.CloseNativeListAfterBatch;
-        if (ImGui.Checkbox(L.T("Close native Friend List window after bulk removal finishes", "Fechar janela nativa Friend List após concluir remoção em massa"), ref closeAfter))
-        {
-            Plugin.Config.CloseNativeListAfterBatch = closeAfter;
-            Plugin.Config.Save();
-        }
+            var closeAfter = Plugin.Config.CloseNativeListAfterBatch;
+            if (UiControls.SettingToggleRow("closeAfter",
+                L.T("Close in-game Friend List when batch finishes", "Fechar Lista de Amigos do jogo ao concluir"),
+                ref closeAfter))
+            {
+                Plugin.Config.CloseNativeListAfterBatch = closeAfter;
+                Plugin.Config.Save();
+            }
 
-        var chatSummary = Plugin.Config.PrintChatSummary;
-        if (ImGui.Checkbox(L.T("Print summary in chat when bulk removal finishes", "Mostrar resumo no chat ao concluir remoção em massa"), ref chatSummary))
-        {
-            Plugin.Config.PrintChatSummary = chatSummary;
-            Plugin.Config.Save();
-        }
-
-        var delaySec = Plugin.Config.RemovalDelayMs / 1000f;
-        ImGui.SetNextItemWidth(220f);
-        if (ImGui.SliderFloat(L.T("Bulk removal delay", "Intervalo de remoção"), ref delaySec, 0.8f, 4.0f, "%.1fs"))
-        {
-            Plugin.Config.RemovalDelayMs = (int)(delaySec * 1000);
-            Plugin.Config.Save();
+            var printChat = Plugin.Config.PrintChatSummary;
+            if (UiControls.SettingToggleRow("printChat",
+                L.T("Print summary in chat after batch completes", "Mostrar resumo no chat ao concluir"),
+                ref printChat))
+            {
+                Plugin.Config.PrintChatSummary = printChat;
+                Plugin.Config.Save();
+            }
         }
 
-        ImGui.Spacing();
-        ImGui.Separator();
-        ImGui.TextColored(Theme.YellowMain, L.T("Commands & Safety", "Comandos & Segurança"));
-        ImGui.BulletText("/flf  |  /friendlistfrenzy — " + L.T("Toggle FriendList Frenzy window", "Abrir/fechar a janela do FriendList Frenzy"));
-        ImGui.BulletText(L.T(
-            "Star (★) any friend to protect them so they can never be selected for bulk removal.",
-            "Clique na estrela (★) para proteger qualquer amigo e impedir que seja selecionado na remoção em massa."));
-        ImGui.BulletText(L.T(
-            "Every bulk removal checks the exact friend name in FFXIV's confirmation dialog before clicking Yes.",
-            "Cada remoção em massa confere o nome exato do amigo no diálogo do jogo antes de confirmar Sim."));
+        using (UiCard.Begin(L.T("Display Preferences", "Preferências de Exibição")))
+        {
+            var showFc = Plugin.Config.ShowFcTag;
+            if (UiControls.SettingToggleRow("showFc", L.T("Show Free Company tags", "Mostrar tags de Free Company"), ref showFc))
+            {
+                Plugin.Config.ShowFcTag = showFc;
+                Plugin.Config.Save();
+            }
+
+            var showNick = Plugin.Config.ShowNickname;
+            if (UiControls.SettingToggleRow("showNick", L.T("Show custom nicknames", "Mostrar apelidos personalizados"), ref showNick))
+            {
+                Plugin.Config.ShowNickname = showNick;
+                Plugin.Config.Save();
+            }
+
+            var showSeen = Plugin.Config.ShowLastSeen;
+            if (UiControls.SettingToggleRow("showSeen", L.T("Show Last Seen column", "Mostrar coluna Visto por Último"), ref showSeen))
+            {
+                Plugin.Config.ShowLastSeen = showSeen;
+                Plugin.Config.Save();
+            }
+        }
+
+        using (UiCard.Begin(L.T("Language & Commands", "Idioma & Comandos")))
+        {
+            ImGui.TextColored(Theme.TextLight, L.T("Interface Language:", "Idioma da Interface:"));
+            ImGui.SameLine();
+            if (ImGui.RadioButton("English", !L.IsPt))
+            {
+                Plugin.Config.Language = "en";
+                Plugin.Config.Save();
+            }
+            ImGui.SameLine();
+            if (ImGui.RadioButton("Português (BR)", L.IsPt))
+            {
+                Plugin.Config.Language = "pt";
+                Plugin.Config.Save();
+            }
+
+            ImGui.Dummy(new Vector2(0, 4f));
+            UiControls.InsetNote(L.T(
+                "Chat commands: /friendlistfrenzy or /flf  •  Right-click any friend row for instant in-game group actions.",
+                "Comandos de chat: /friendlistfrenzy ou /flf  •  Clique com o botão direito em qualquer amigo para ações rápidas de grupo."));
+        }
+
+        ImGui.EndChild();
+    }
+
+    private void DrawFilterPill(string label, int value)
+    {
+        var active = statusFilter == value;
+        ImGui.PushStyleColor(ImGuiCol.Button, active ? Theme.PurpleMain : Theme.BgSurface);
+        ImGui.PushStyleColor(ImGuiCol.ButtonHovered, active ? Theme.PurpleBright : Theme.BgElevated);
+        ImGui.PushStyleColor(ImGuiCol.Text, active ? Theme.YellowMain : Theme.TextLight);
+        if (ImGui.Button($"{label}##sf_{value}"))
+            statusFilter = value;
+        ImGui.PopStyleColor(3);
+    }
+
+    private void OpenEditModalFor(FriendEntry friend, FriendMetadata meta)
+    {
+        editingContentId = friend.ContentId;
+        editFriendName = friend.Name;
+        editNickname = meta.Nickname;
+        editNote = meta.Note;
+        editNativeGroup = friend.NativeGroup;
+        editOriginalNativeGroup = friend.NativeGroup;
+        editProtected = meta.IsProtected;
+        editUseColor = meta.UseCustomColor;
+        editColor = meta.CustomColor;
+        openEditModal = true;
     }
 
     private void DrawEditFriendModal()
     {
         if (openEditModal)
         {
-            ImGui.OpenPopup("###EditFriendPopup");
+            ImGui.OpenPopup(EditModalId);
             openEditModal = false;
         }
 
         var open = true;
-        ImGui.SetNextWindowSize(new Vector2(440, 320), ImGuiCond.Appearing);
-        if (ImGui.BeginPopupModal(L.T("Edit Friend###EditFriendPopup", "Editar Amigo###EditFriendPopup"), ref open, ImGuiWindowFlags.NoResize))
+        ImGui.SetNextWindowSize(new Vector2(450, 395), ImGuiCond.Appearing);
+        var title = L.T($"Edit Friend{EditModalId}", $"Editar Amigo{EditModalId}");
+        if (ImGui.BeginPopupModal(title, ref open, ImGuiWindowFlags.NoResize))
         {
             ImGui.TextColored(Theme.YellowMain, editFriendName);
             ImGui.Separator();
+            ImGui.Spacing();
 
+            ImGui.TextColored(Theme.TextMuted, L.T("Nickname:", "Apelido:"));
             ImGui.SetNextItemWidth(-1);
-            ImGui.InputTextWithHint("##Nick", L.T("Nickname (optional)...", "Apelido (opcional)..."), ref editNickname, 48);
+            ImGui.InputText("##EditNick", ref editNickname, 64);
 
-            // Group selector
-            var curGrpName = string.IsNullOrEmpty(editGroupId)
-                ? L.T("No Group", "Sem Grupo")
-                : Plugin.Config.FindGroup(editGroupId)?.Name ?? L.T("No Group", "Sem Grupo");
-
+            ImGui.TextColored(Theme.TextMuted, L.T("FFXIV In-Game Friend Group:", "Grupo Nativo no FFXIV:"));
             ImGui.SetNextItemWidth(-1);
-            if (ImGui.BeginCombo("##EditGrp", curGrpName))
+            var preview = editNativeGroup == 0
+                ? L.T("○ Ungrouped", "○ Sem Grupo")
+                : Plugin.Config.GetNativeGroupLabel(editNativeGroup);
+            if (ImGui.BeginCombo("##EditNativeGrp", preview))
             {
-                if (ImGui.Selectable(L.T("No Group", "Sem Grupo"), string.IsNullOrEmpty(editGroupId)))
-                    editGroupId = string.Empty;
-                foreach (var g in Plugin.Config.Groups)
+                if (ImGui.Selectable(L.T("○ Ungrouped", "○ Sem Grupo"), editNativeGroup == 0))
+                    editNativeGroup = 0;
+                foreach (var g in NativeFriendGroups.All)
                 {
-                    if (ImGui.Selectable(g.Name, editGroupId == g.Id))
-                        editGroupId = g.Id;
+                    ImGui.PushStyleColor(ImGuiCol.Text, Plugin.Config.GetNativeGroupColor(g.Id));
+                    if (ImGui.Selectable(Plugin.Config.GetNativeGroupLabel(g.Id), editNativeGroup == g.Id))
+                        editNativeGroup = g.Id;
+                    ImGui.PopStyleColor();
                 }
                 ImGui.EndCombo();
             }
@@ -713,27 +1046,39 @@ public sealed class MainWindow : Window
             }
 
             ImGui.TextColored(Theme.TextMuted, L.T("Personal Note:", "Nota Pessoal:"));
-            ImGui.InputTextMultiline("##EditNote", ref editNote, 256, new Vector2(-1, 76f));
+            ImGui.InputTextMultiline("##EditNote", ref editNote, 256, new Vector2(-1, 78f));
 
             ImGui.Spacing();
-            if (ImGui.Button(L.T("Save", "Salvar"), new Vector2(120, 0)))
+            if (ImGui.Button(L.T("Save", "Salvar"), new Vector2(130, 0)))
             {
                 var meta = Plugin.Config.GetOrCreateMeta(editingContentId, editFriendName);
                 meta.Nickname = editNickname.Trim();
                 meta.Note = editNote.Trim();
-                meta.GroupId = editGroupId;
                 meta.IsProtected = editProtected;
                 meta.UseCustomColor = editUseColor;
                 meta.CustomColor = editColor;
-                if (meta.IsProtected) selectedIds.Remove(editingContentId);
                 Plugin.Config.Save();
+
+                // If native in-game group changed, sync it directly to FFXIV's Friend List!
+                if (editNativeGroup != editOriginalNativeGroup && !Plugin.BulkRemover.IsRunning)
+                {
+                    var live = Plugin.Friends.Friends.FirstOrDefault(f => f.ContentId == editingContentId);
+                    if (live != null)
+                    {
+                        if (editNativeGroup == 0)
+                            Plugin.BulkRemover.StartClearGroupBatch([live]);
+                        else
+                            Plugin.BulkRemover.StartSetGroupBatch([live], editNativeGroup);
+                    }
+                }
+
                 ImGui.CloseCurrentPopup();
             }
             ImGui.SameLine();
+            ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
             if (ImGui.Button(L.T("Cancel", "Cancelar"), new Vector2(120, 0)))
-            {
                 ImGui.CloseCurrentPopup();
-            }
+            ImGui.PopStyleColor();
 
             ImGui.EndPopup();
         }
@@ -743,45 +1088,96 @@ public sealed class MainWindow : Window
     {
         if (openConfirmModal)
         {
-            ImGui.OpenPopup("###ConfirmBulkPopup");
+            ImGui.OpenPopup(ConfirmModalId);
             openConfirmModal = false;
         }
 
         var open = true;
-        ImGui.SetNextWindowSize(new Vector2(480, 360), ImGuiCond.Appearing);
-        if (ImGui.BeginPopupModal(L.T("Confirm Bulk Friend Removal###ConfirmBulkPopup", "Confirmar Remoção em Massa###ConfirmBulkPopup"), ref open, ImGuiWindowFlags.NoResize))
+        ImGui.SetNextWindowSize(new Vector2(490, 380), ImGuiCond.Appearing);
+        var modalTitle = pendingBatchKind switch
         {
-            ImGui.TextColored(Theme.RedDanger, L.T(
-                $"You are about to remove {pendingBatchTargets.Count} friend(s) from your Friend List:",
-                $"Você está prestes a remover {pendingBatchTargets.Count} amigo(s) da sua Lista de Amigos:"));
-            ImGui.TextColored(Theme.TextMuted, L.T(
-                "Please avoid manually clicking game menus while the queue runs. You can Pause or Cancel anytime.",
-                "Evite clicar manualmente em menus do jogo enquanto a fila roda. Você pode Pausar ou Cancelar a qualquer momento."));
+            BulkActionKind.RemoveFriend => L.T($"Confirm Bulk Friend Removal{ConfirmModalId}", $"Confirmar Remoção em Massa{ConfirmModalId}"),
+            BulkActionKind.SetNativeGroup => L.T($"Confirm In-Game Group Sync{ConfirmModalId}", $"Confirmar Alteração de Grupo no Jogo{ConfirmModalId}"),
+            BulkActionKind.ClearNativeGroup => L.T($"Confirm Remove from In-Game Group{ConfirmModalId}", $"Confirmar Remoção do Grupo no Jogo{ConfirmModalId}"),
+            _ => $"Confirm{ConfirmModalId}",
+        };
+
+        if (ImGui.BeginPopupModal(modalTitle, ref open, ImGuiWindowFlags.NoResize))
+        {
+            var isRemove = pendingBatchKind == BulkActionKind.RemoveFriend;
+            var headerCol = isRemove ? Theme.RedDanger : Theme.YellowMain;
+
+            var headline = pendingBatchKind switch
+            {
+                BulkActionKind.RemoveFriend => L.T(
+                    $"Remove {pendingBatchTargets.Count} friend(s) from your FFXIV Friend List:",
+                    $"Remover {pendingBatchTargets.Count} amigo(s) da sua Lista de Amigos do FFXIV:"),
+                BulkActionKind.SetNativeGroup => L.T(
+                    $"Assign {pendingBatchTargets.Count} friend(s) to native group {Plugin.Config.GetNativeGroupLabel(pendingBatchGroup)}:",
+                    $"Mover {pendingBatchTargets.Count} amigo(s) para o grupo nativo {Plugin.Config.GetNativeGroupLabel(pendingBatchGroup)}:"),
+                BulkActionKind.ClearNativeGroup => L.T(
+                    $"Remove {pendingBatchTargets.Count} friend(s) from their native in-game Friend Group:",
+                    $"Remover {pendingBatchTargets.Count} amigo(s) do seu Grupo nativo no FFXIV:"),
+                _ => string.Empty,
+            };
+
+            UiControls.TextWrappedColored(headerCol, headline);
+            UiControls.TextWrappedColored(Theme.TextMuted, L.T(
+                "Avoid clicking game menus while the queue runs. You can Pause or Cancel at any time.",
+                "Evite clicar nos menus do jogo enquanto a fila roda. Você pode Pausar ou Cancelar a qualquer momento."));
 
             ImGui.Spacing();
-            ImGui.BeginChild("##ConfirmList", new Vector2(0, 185f), true);
-            foreach (var t in pendingBatchTargets)
+            ImGui.PushStyleColor(ImGuiCol.ChildBg, Theme.BgDark);
+            if (ImGui.BeginChild("##ConfirmList", new Vector2(0, 195f), true))
             {
-                ImGui.BulletText($"{t.Name}  ({t.HomeWorldName})");
+                foreach (var t in pendingBatchTargets)
+                {
+                    var curGrp = t.NativeGroup > 0 ? $"  [{Plugin.Config.GetNativeGroupLabel(t.NativeGroup)}]" : string.Empty;
+                    ImGui.BulletText($"{t.Name} ({t.HomeWorldName}){curGrp}");
+                }
             }
             ImGui.EndChild();
+            ImGui.PopStyleColor();
 
             ImGui.Spacing();
-            ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
-            ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.RedDanger);
-            if (ImGui.Button(L.T($"Yes, Remove {pendingBatchTargets.Count} Friends", $"Sim, Remover {pendingBatchTargets.Count} Amigos"), new Vector2(240, 0)))
+            if (isRemove)
             {
-                Plugin.BulkRemover.StartBatch(pendingBatchTargets);
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.RedDangerDark);
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.RedDanger);
+            }
+            else
+            {
+                ImGui.PushStyleColor(ImGuiCol.Button, Theme.PurpleMain);
+                ImGui.PushStyleColor(ImGuiCol.ButtonHovered, Theme.PurpleBright);
+            }
+
+            var confirmLabel = pendingBatchKind switch
+            {
+                BulkActionKind.RemoveFriend => L.T($"Yes, Remove {pendingBatchTargets.Count} Friends", $"Sim, Remover {pendingBatchTargets.Count} Amigos"),
+                BulkActionKind.SetNativeGroup => L.T($"Sync {pendingBatchTargets.Count} to In-Game Group", $"Sincronizar {pendingBatchTargets.Count} no Jogo"),
+                BulkActionKind.ClearNativeGroup => L.T($"Clear Group for {pendingBatchTargets.Count} Friends", $"Limpar Grupo de {pendingBatchTargets.Count} Amigos"),
+                _ => L.T("Confirm", "Confirmar"),
+            };
+
+            if (ImGui.Button(confirmLabel, new Vector2(265, 0)))
+            {
+                if (pendingBatchKind == BulkActionKind.RemoveFriend)
+                    Plugin.BulkRemover.StartRemoveBatch(pendingBatchTargets);
+                else if (pendingBatchKind == BulkActionKind.SetNativeGroup)
+                    Plugin.BulkRemover.StartSetGroupBatch(pendingBatchTargets, pendingBatchGroup);
+                else if (pendingBatchKind == BulkActionKind.ClearNativeGroup)
+                    Plugin.BulkRemover.StartClearGroupBatch(pendingBatchTargets);
+
                 selectedIds.Clear();
                 ImGui.CloseCurrentPopup();
             }
             ImGui.PopStyleColor(2);
 
             ImGui.SameLine();
+            ImGui.PushStyleColor(ImGuiCol.Button, Theme.BgSurface);
             if (ImGui.Button(L.T("Cancel", "Cancelar"), new Vector2(120, 0)))
-            {
                 ImGui.CloseCurrentPopup();
-            }
+            ImGui.PopStyleColor();
 
             ImGui.EndPopup();
         }
@@ -796,25 +1192,23 @@ public sealed class MainWindow : Window
         else if (statusFilter == 2) result = result.Where(f => !f.IsOnline);
         else if (statusFilter == 3) result = result.Where(f => Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name).IsProtected);
 
-        if (groupFilterId == "__none__")
-        {
-            result = result.Where(f => string.IsNullOrEmpty(Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name).GroupId));
-        }
-        else if (groupFilterId != "__all__")
-        {
-            result = result.Where(f => Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name).GroupId == groupFilterId);
-        }
+        if (nativeGroupFilter == 0)
+            result = result.Where(f => f.NativeGroup == 0);
+        else if (nativeGroupFilter > 0)
+            result = result.Where(f => f.NativeGroup == nativeGroupFilter);
 
         if (!string.IsNullOrEmpty(q))
         {
             result = result.Where(f =>
             {
                 var meta = Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name);
+                var groupLabel = f.NativeGroup > 0 ? Plugin.Config.GetNativeGroupLabel(f.NativeGroup, false) : string.Empty;
                 return f.Name.Contains(q, StringComparison.OrdinalIgnoreCase)
                     || f.HomeWorldName.Contains(q, StringComparison.OrdinalIgnoreCase)
                     || f.CurrentWorldName.Contains(q, StringComparison.OrdinalIgnoreCase)
                     || f.FcTag.Contains(q, StringComparison.OrdinalIgnoreCase)
                     || f.LocationName.Contains(q, StringComparison.OrdinalIgnoreCase)
+                    || groupLabel.Contains(q, StringComparison.OrdinalIgnoreCase)
                     || meta.Nickname.Contains(q, StringComparison.OrdinalIgnoreCase)
                     || meta.Note.Contains(q, StringComparison.OrdinalIgnoreCase);
             });
@@ -828,7 +1222,7 @@ public sealed class MainWindow : Window
                        .ThenByDescending(f => Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name).LastSeenOnlineUtc ?? DateTime.MinValue)
                        .ThenBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
                        .ToList(),
-            4 => result.OrderBy(f => Plugin.Config.FindGroup(Plugin.Config.GetOrCreateMeta(f.ContentId, f.Name).GroupId)?.Name ?? "zzz", StringComparer.OrdinalIgnoreCase)
+            4 => result.OrderBy(f => f.NativeGroup == 0 ? 99 : f.NativeGroup)
                        .ThenByDescending(f => f.IsOnline)
                        .ThenBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
                        .ToList(),
