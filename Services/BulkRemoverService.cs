@@ -39,7 +39,7 @@ public sealed unsafe class BulkRemoverService : IDisposable
     private readonly List<BulkActionLogEntry> actionLog = new();
     private readonly HashSet<string> removeFriendLabels = new(StringComparer.OrdinalIgnoreCase);
     private readonly HashSet<string> assignGroupLabels = new(StringComparer.OrdinalIgnoreCase);
-    private readonly HashSet<string> removeGroupLabels = new(StringComparer.OrdinalIgnoreCase);
+    private readonly HashSet<ushort> visibleAddonIdsBefore = new();
     private readonly Stopwatch clock = Stopwatch.StartNew();
 
     private BulkEngineState state = BulkEngineState.Idle;
@@ -53,7 +53,8 @@ public sealed unsafe class BulkRemoverService : IDisposable
     private int lastObservedEntryCount = -1;
     private long entryCountStableSinceMs;
     private int countBeforeRemoval;
-    private string contextMenuSnapshot = string.Empty;
+    private ushort groupDialogAddonId;
+    private bool groupDialogFallbackSent;
 
     private const long ListLoadTimeoutMs = 9000;
     private const long MenuTimeoutMs = 4500;
@@ -91,22 +92,20 @@ public sealed unsafe class BulkRemoverService : IDisposable
         removeFriendLabels.Add("Retirer de la liste d'amis");
         removeFriendLabels.Add("フレンドリストから削除");
 
+        assignGroupLabels.Add("Assign Friend Group");
         assignGroupLabels.Add("Add to Friend Group");
         assignGroupLabels.Add("Change Friend Group");
         assignGroupLabels.Add("Assign to Friend Group");
-        assignGroupLabels.Add("Move to Friend Group");
+        assignGroupLabels.Add("Freundesgruppe zuweisen");
         assignGroupLabels.Add("Zu Freundesgruppe hinzufügen");
         assignGroupLabels.Add("Freundesgruppe ändern");
+        assignGroupLabels.Add("Attribuer un groupe d'amis");
+        assignGroupLabels.Add("Attribuer à un groupe d'amis");
         assignGroupLabels.Add("Ajouter à un groupe d'amis");
         assignGroupLabels.Add("Changer de groupe d'amis");
+        assignGroupLabels.Add("フレンドグループ設定");
         assignGroupLabels.Add("フレンドグループに追加");
         assignGroupLabels.Add("フレンドグループを変更");
-
-        removeGroupLabels.Add("Remove from Friend Group");
-        removeGroupLabels.Add("Aus Freundesgruppe entfernen");
-        removeGroupLabels.Add("Retirer du groupe d'amis");
-        removeGroupLabels.Add("フレンドグループから削除");
-        removeGroupLabels.Add("フレンドグループから外す");
 
         try
         {
@@ -125,24 +124,17 @@ public sealed unsafe class BulkRemoverService : IDisposable
                     {
                         removeFriendLabels.Add(text);
                     }
-                    else if (text.Contains("Add to Friend Group", StringComparison.OrdinalIgnoreCase)
+                    else if (text.Contains("Assign Friend Group", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("Add to Friend Group", StringComparison.OrdinalIgnoreCase)
                         || text.Contains("Change Friend Group", StringComparison.OrdinalIgnoreCase)
-                        || text.Contains("Assign to Friend Group", StringComparison.OrdinalIgnoreCase)
-                        || text.Contains("Zu Freundesgruppe", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("Freundesgruppe zuweisen", StringComparison.OrdinalIgnoreCase)
                         || text.Contains("Freundesgruppe ändern", StringComparison.OrdinalIgnoreCase)
-                        || text.Contains("groupe d'amis", StringComparison.OrdinalIgnoreCase) && !text.Contains("Retirer", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("groupe d'amis", StringComparison.OrdinalIgnoreCase)
+                        || text.Contains("フレンドグループ設定", StringComparison.Ordinal)
                         || text.Contains("フレンドグループに追加", StringComparison.Ordinal)
                         || text.Contains("フレンドグループを変更", StringComparison.Ordinal))
                     {
                         assignGroupLabels.Add(text);
-                    }
-                    else if (text.Contains("Remove from Friend Group", StringComparison.OrdinalIgnoreCase)
-                        || text.Contains("Aus Freundesgruppe entfernen", StringComparison.OrdinalIgnoreCase)
-                        || text.Contains("Retirer du groupe d'amis", StringComparison.OrdinalIgnoreCase)
-                        || text.Contains("フレンドグループから削除", StringComparison.Ordinal)
-                        || text.Contains("フレンドグループから外す", StringComparison.Ordinal))
-                    {
-                        removeGroupLabels.Add(text);
                     }
                 }
             }
@@ -569,7 +561,7 @@ public sealed unsafe class BulkRemoverService : IDisposable
                     {
                         BulkActionKind.RemoveFriend => IsRemoveFriendLabel(text),
                         BulkActionKind.SetNativeGroup => IsAssignGroupLabel(text),
-                        BulkActionKind.ClearNativeGroup => IsRemoveGroupLabel(text),
+                        BulkActionKind.ClearNativeGroup => IsAssignGroupLabel(text),
                         _ => false,
                     };
 
@@ -579,7 +571,12 @@ public sealed unsafe class BulkRemoverService : IDisposable
 
                 if (foundIdx >= 0)
                 {
-                    contextMenuSnapshot = string.Join("|", allEntries);
+                    if (currentTarget.Action is BulkActionKind.SetNativeGroup or BulkActionKind.ClearNativeGroup)
+                    {
+                        SnapshotVisibleAddonIds();
+                        groupDialogAddonId = 0;
+                        groupDialogFallbackSent = false;
+                    }
 
                     var vals = stackalloc AtkValue[3];
                     vals[0].Type = AtkValueType.Int;
@@ -596,31 +593,22 @@ public sealed unsafe class BulkRemoverService : IDisposable
                             L.T($"Confirming removal of {currentTarget.Name}...", $"Confirmando remoção de {currentTarget.Name}..."),
                             220);
                     }
-                    else if (currentTarget.Action == BulkActionKind.SetNativeGroup)
-                    {
-                        Transition(BulkEngineState.WaitingForGroupPicker,
-                            L.T($"Picking group {Plugin.Config.GetNativeGroupLabel(currentTarget.TargetGroup)} for {currentTarget.Name}...",
-                                $"Escolhendo grupo {Plugin.Config.GetNativeGroupLabel(currentTarget.TargetGroup)} para {currentTarget.Name}..."),
-                            180);
-                    }
                     else
                     {
-                        Transition(BulkEngineState.WaitingForGroupVerify,
-                            L.T($"Removing {currentTarget.Name} from in-game group...", $"Removendo {currentTarget.Name} do grupo no jogo..."),
-                            350);
+                        var targetGrp = currentTarget.Action == BulkActionKind.ClearNativeGroup ? (byte)0 : currentTarget.TargetGroup;
+                        var grpName = targetGrp == 0 ? L.T("None", "Nenhum") : Plugin.Config.GetNativeGroupLabel(targetGrp);
+                        Transition(BulkEngineState.WaitingForGroupPicker,
+                            L.T($"Assigning {grpName} to {currentTarget.Name}...", $"Atribuindo {grpName} para {currentTarget.Name}..."),
+                            220);
                     }
                     return;
                 }
 
-                Plugin.Log.Debug($"[FriendListFrenzy] ContextMenu entries for {currentTarget.Name} ({currentTarget.Action}): {string.Join(" | ", allEntries)}");
+                Plugin.Log.Info($"[FriendListFrenzy] ContextMenu entries for {currentTarget.Name} ({currentTarget.Action}): {string.Join(" | ", allEntries)}");
                 cm->Close(true);
-                FailCurrentTarget(currentTarget.Action switch
-                {
-                    BulkActionKind.RemoveFriend => L.T("'Remove from Friend List' not found in menu.", "Opção 'Remover da Lista de Amigos' não encontrada."),
-                    BulkActionKind.SetNativeGroup => L.T("'Add/Change Friend Group' not found in menu.", "Opção 'Adicionar/Alterar Grupo' não encontrada."),
-                    BulkActionKind.ClearNativeGroup => L.T("'Remove from Friend Group' not found in menu.", "Opção 'Remover do Grupo' não encontrada."),
-                    _ => L.T("Menu option not found.", "Opção do menu não encontrada."),
-                });
+                FailCurrentTarget(currentTarget.Action == BulkActionKind.RemoveFriend
+                    ? L.T("'Remove from Friend List' not found in menu.", "Opção 'Remover da Lista de Amigos' não encontrada.")
+                    : L.T("'Assign Friend Group' not found in menu.", "Opção 'Assign Friend Group' não encontrada no menu."));
                 return;
             }
         }
@@ -650,19 +638,26 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        var iconIdx = Math.Clamp(currentTarget.TargetGroup - 1, 0, NativeFriendGroups.MaxGroupId - 1);
+        // Target index in the "Friend Groups" dialog list: 0 = None, 1..7 = ★Group 1 .. ♣Group 7
+        var expectedGroup = currentTarget.Action == BulkActionKind.ClearNativeGroup
+            ? 0
+            : Math.Clamp((int)currentTarget.TargetGroup, 1, NativeFriendGroups.MaxGroupId);
 
-        // Primary path: FFXIV opens ContextIconMenu with the 7 Friend Group icons (0..6 = Star..Club)
-        var iconMenu = GetVisibleAddon("ContextIconMenu");
-        if (iconMenu != null && iconMenu->IsReady)
+        var dlg = FindFriendGroupDialog();
+        if (dlg != null && dlg->IsVisible && dlg->IsReady)
         {
-            var vals = stackalloc AtkValue[5];
-            vals[0].Type = AtkValueType.Int; vals[0].Int = 0;
-            vals[1].Type = AtkValueType.Int; vals[1].Int = iconIdx;
-            vals[2].Type = AtkValueType.Int; vals[2].Int = 0;
-            vals[3].Type = AtkValueType.Int; vals[3].Int = 0;
-            vals[4].Type = AtkValueType.Int; vals[4].Int = 0;
-            iconMenu->FireCallback(5, vals, true);
+            groupDialogAddonId = dlg->Id;
+
+            // 1. Select the exact row (0 = None, 1..7 = Group 1..7) on the 8-item AtkComponentList inside the dialog
+            SelectGroupRowInDialog(dlg, expectedGroup);
+
+            // 2. Fire Apply callback: (0, expectedGroup) commits & closes the "Friend Groups" dialog!
+            var vals = stackalloc AtkValue[2];
+            vals[0].Type = AtkValueType.Int;
+            vals[0].Int = 0; // Apply
+            vals[1].Type = AtkValueType.Int;
+            vals[1].Int = expectedGroup; // 0 = None, 1..7 = Group 1..7
+            dlg->FireCallback(2, vals, true);
 
             Transition(BulkEngineState.WaitingForGroupVerify,
                 L.T($"Applying group to {currentTarget.Name}...", $"Aplicando grupo para {currentTarget.Name}..."),
@@ -670,44 +665,9 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        // Fallback path: if FFXIV rendered a submenu ContextMenu instead of ContextIconMenu
-        var cmPtr = Plugin.GameGui.GetAddonByName("ContextMenu", 1);
-        if (cmPtr != nint.Zero)
-        {
-            var cm = (AddonContextMenu*)cmPtr.Address;
-            if (cm != null && cm->IsVisible && cm->IsReady)
-            {
-                var entriesCount = (int)cm->AtkValues[0].UInt;
-                var entries = new List<string>(entriesCount);
-                for (var i = 0; i < entriesCount; i++)
-                {
-                    var valIdx = i + 8;
-                    if (valIdx >= cm->AtkValuesCount) break;
-                    var strPtr = cm->AtkValues[valIdx].String.Value;
-                    if (strPtr == null) continue;
-                    entries.Add(MemoryHelper.ReadSeStringNullTerminated((nint)strPtr).TextValue.Trim());
-                }
-
-                var snap = string.Join("|", entries);
-                if (!string.Equals(snap, contextMenuSnapshot, StringComparison.Ordinal) && entriesCount >= iconIdx + 1 && entriesCount <= 9)
-                {
-                    var vals = stackalloc AtkValue[3];
-                    vals[0].Type = AtkValueType.Int; vals[0].Int = 0;
-                    vals[1].Type = AtkValueType.Int; vals[1].Int = iconIdx;
-                    vals[2].Type = AtkValueType.Int; vals[2].Int = 0;
-                    cm->FireCallback(3, vals, true);
-
-                    Transition(BulkEngineState.WaitingForGroupVerify,
-                        L.T($"Applying group to {currentTarget.Name}...", $"Aplicando grupo para {currentTarget.Name}..."),
-                        350);
-                    return;
-                }
-            }
-        }
-
         if (now - stateEnteredAtMs > MenuTimeoutMs)
         {
-            FailCurrentTarget(L.T("Friend Group icon picker did not open.", "Seletor de ícones de Grupo não abriu."));
+            FailCurrentTarget(L.T("'Friend Groups' window did not open.", "Janela 'Friend Groups' não abriu."));
         }
     }
 
@@ -719,23 +679,25 @@ public sealed unsafe class BulkRemoverService : IDisposable
             return;
         }
 
-        // Handle unexpected SelectYesno if game ever prompts during group removal
-        var ynPtr = Plugin.GameGui.GetAddonByName("SelectYesno", 1);
-        if (ynPtr != nint.Zero)
+        // If the Friend Groups dialog is still open after 350ms, try 1-arg Apply callback (0) once
+        var openDlg = groupDialogAddonId != 0 ? FindVisibleAddonById(groupDialogAddonId) : FindFriendGroupDialog();
+        if (openDlg != null && openDlg->IsVisible && openDlg->IsReady)
         {
-            var yn = (AddonSelectYesno*)ynPtr.Address;
-            if (yn != null && yn->IsVisible && yn->IsReady)
+            if (!groupDialogFallbackSent && now - stateEnteredAtMs >= 350)
             {
+                groupDialogFallbackSent = true;
+                var expectedGrp = currentTarget.Action == BulkActionKind.ClearNativeGroup ? 0 : (int)currentTarget.TargetGroup;
+                SelectGroupRowInDialog(openDlg, expectedGrp);
                 var vals = stackalloc AtkValue[1];
                 vals[0].Type = AtkValueType.Int;
-                vals[0].Int = 0; // Yes
-                yn->FireCallback(1, vals, true);
+                vals[0].Int = 0; // Apply
+                openDlg->FireCallback(1, vals, true);
                 nextStepAtMs = now + 350;
                 return;
             }
         }
 
-        if (GetVisibleAddon("ContextMenu") != null || GetVisibleAddon("ContextIconMenu") != null)
+        if (GetVisibleAddon("ContextMenu") != null)
             return;
 
         Plugin.Friends.RefreshFromMemory();
@@ -744,10 +706,14 @@ public sealed unsafe class BulkRemoverService : IDisposable
 
         if (liveGroup == expectedGroup)
         {
+            // Close dialog if it somehow stayed open after update
+            if (openDlg != null && openDlg->IsVisible)
+                openDlg->Close(true);
+
             SucceededCount++;
             var msg = expectedGroup == 0
-                ? L.T("Removed from in-game group", "Removido do grupo no jogo")
-                : L.T($"Moved to {Plugin.Config.GetNativeGroupLabel(expectedGroup)}", $"Movido para {Plugin.Config.GetNativeGroupLabel(expectedGroup)}");
+                ? L.T("Removed from in-game group (None)", "Removido do grupo no jogo (None)")
+                : L.T($"Assigned to {Plugin.Config.GetNativeGroupLabel(expectedGroup)}", $"Atribuído a {Plugin.Config.GetNativeGroupLabel(expectedGroup)}");
             AddLog(currentTarget.Name, currentTarget.Action, true, msg);
             currentTarget = null;
 
@@ -760,6 +726,8 @@ public sealed unsafe class BulkRemoverService : IDisposable
 
         if (now - stateEnteredAtMs > ListLoadTimeoutMs)
         {
+            if (openDlg != null && openDlg->IsVisible)
+                openDlg->Close(true);
             Plugin.Friends.RequestRefresh();
             FailCurrentTarget(L.T("Timed out waiting for group update.", "Tempo esgotado aguardando atualização do grupo."));
         }
@@ -955,23 +923,106 @@ public sealed unsafe class BulkRemoverService : IDisposable
         if (string.IsNullOrWhiteSpace(text)) return false;
         if (assignGroupLabels.Contains(text)) return true;
 
-        return (text.Contains("Friend Group", StringComparison.OrdinalIgnoreCase) && !text.Contains("Remove", StringComparison.OrdinalIgnoreCase))
-            || (text.Contains("Freundesgruppe", StringComparison.OrdinalIgnoreCase) && !text.Contains("entfernen", StringComparison.OrdinalIgnoreCase))
-            || (text.Contains("groupe d'amis", StringComparison.OrdinalIgnoreCase) && !text.Contains("Retirer", StringComparison.OrdinalIgnoreCase))
-            || text.Contains("フレンドグループに追加", StringComparison.Ordinal)
-            || text.Contains("フレンドグループを変更", StringComparison.Ordinal);
+        return text.Contains("Friend Group", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("Freundesgruppe", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("groupe d'amis", StringComparison.OrdinalIgnoreCase)
+            || text.Contains("フレンドグループ", StringComparison.Ordinal);
     }
 
-    private bool IsRemoveGroupLabel(string text)
+    private void SnapshotVisibleAddonIds()
     {
-        if (string.IsNullOrWhiteSpace(text)) return false;
-        if (removeGroupLabels.Contains(text)) return true;
+        visibleAddonIdsBefore.Clear();
+        var stage = AtkStage.Instance();
+        if (stage == null || stage->RaptureAtkUnitManager == null) return;
+        ref var loaded = ref stage->RaptureAtkUnitManager->AtkUnitManager.AllLoadedUnitsList;
+        for (var i = 0; i < loaded.Count; i++)
+        {
+            var unit = loaded.Entries[i].Value;
+            if (unit != null && unit->IsVisible)
+                visibleAddonIdsBefore.Add(unit->Id);
+        }
+    }
 
-        return text.Contains("Remove from Friend Group", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("Aus Freundesgruppe entfernen", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("Retirer du groupe d'amis", StringComparison.OrdinalIgnoreCase)
-            || text.Contains("フレンドグループから削除", StringComparison.Ordinal)
-            || text.Contains("フレンドグループから外す", StringComparison.Ordinal);
+    private AtkUnitBase* FindFriendGroupDialog()
+    {
+        var stage = AtkStage.Instance();
+        if (stage == null || stage->RaptureAtkUnitManager == null) return null;
+        ref var loaded = ref stage->RaptureAtkUnitManager->AtkUnitManager.AllLoadedUnitsList;
+
+        // Pass 1: Look for any newly opened visible ready addon that has an 8-item list (None + 7 Groups)
+        AtkUnitBase* fallbackCandidate = null;
+        for (var i = 0; i < loaded.Count; i++)
+        {
+            var unit = loaded.Entries[i].Value;
+            if (unit == null || !unit->IsVisible || !unit->IsReady) continue;
+            if (visibleAddonIdsBefore.Contains(unit->Id)) continue;
+
+            var name = unit->NameString;
+            if (name.Equals("ContextMenu", StringComparison.OrdinalIgnoreCase)
+                || name.Equals("FriendList", StringComparison.OrdinalIgnoreCase))
+                continue;
+
+            if (HasEightItemGroupList(unit))
+            {
+                Plugin.Log.Debug($"[FriendListFrenzy] Detected Friend Groups dialog addon: '{name}' (Id={unit->Id}, AtkValues={unit->AtkValuesCount})");
+                return unit;
+            }
+
+            if (name.Contains("Friend", StringComparison.OrdinalIgnoreCase)
+                || name.Contains("Group", StringComparison.OrdinalIgnoreCase)
+                || name.Contains("Social", StringComparison.OrdinalIgnoreCase))
+            {
+                fallbackCandidate = unit;
+            }
+        }
+
+        return fallbackCandidate;
+    }
+
+    private static AtkUnitBase* FindVisibleAddonById(ushort id)
+    {
+        var stage = AtkStage.Instance();
+        if (stage == null || stage->RaptureAtkUnitManager == null) return null;
+        ref var loaded = ref stage->RaptureAtkUnitManager->AtkUnitManager.AllLoadedUnitsList;
+        for (var i = 0; i < loaded.Count; i++)
+        {
+            var unit = loaded.Entries[i].Value;
+            if (unit != null && unit->Id == id && unit->IsVisible)
+                return unit;
+        }
+        return null;
+    }
+
+    private static bool HasEightItemGroupList(AtkUnitBase* unit)
+    {
+        for (var i = 0; i < unit->UldManager.NodeListCount; i++)
+        {
+            var node = unit->UldManager.NodeList[i];
+            if (node == null || node->Type != NodeType.Component) continue;
+            var compNode = (AtkComponentNode*)node;
+            if (compNode->Component == null || compNode->Component->GetComponentType() != ComponentType.List) continue;
+            var list = (AtkComponentList*)compNode->Component;
+            if (list->ListLength == 8)
+                return true;
+        }
+        return false;
+    }
+
+    private static void SelectGroupRowInDialog(AtkUnitBase* unit, int rowIndex)
+    {
+        for (var i = 0; i < unit->UldManager.NodeListCount; i++)
+        {
+            var node = unit->UldManager.NodeList[i];
+            if (node == null || node->Type != NodeType.Component) continue;
+            var compNode = (AtkComponentNode*)node;
+            if (compNode->Component == null || compNode->Component->GetComponentType() != ComponentType.List) continue;
+            var list = (AtkComponentList*)compNode->Component;
+            if (list->ListLength == 8)
+            {
+                list->SelectItem(rowIndex);
+                return;
+            }
+        }
     }
 
     private static AtkUnitBase* GetVisibleAddon(string name)

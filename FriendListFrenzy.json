@@ -2,7 +2,7 @@
   "Author": "n0way02",
   "Name": "FriendList Frenzy",
   "InternalName": "FriendListFrenzy",
-  "AssemblyVersion": "1.0.0.4",
+  "AssemblyVersion": "1.0.0.5",
   "Description": "Modern FFXIV Friend List manager with native in-game Friend Group recognition & bulk sync (add, change, or remove friends from FFXIV Friend Groups in bulk), instant search, nicknames, notes, Last Seen tracking, protected favorites, and safe Bulk Friend Removal. Bilingual EN / PT-BR UI.",
   "ApplicableVersion": "any",
   "Punchline": "Enhanced Friend List with native in-game Friend Groups, bulk group sync & safe Bulk Removal.",
